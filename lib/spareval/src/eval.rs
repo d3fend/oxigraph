@@ -25,11 +25,13 @@ use spargebra::term::{
     GroundTerm, GroundTermPattern, NamedNodePattern, TermPattern, TriplePattern,
 };
 use sparopt::algebra::{
-    AggregateExpression, Expression, GraphPattern, JoinAlgorithm, LeftJoinAlgorithm,
+    AggregateExpression, Expression, Function, GraphPattern, JoinAlgorithm, LeftJoinAlgorithm,
     MinusAlgorithm, OrderExpression,
 };
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
+use std::collections::VecDeque;
+use std::env;
 use std::hash::{Hash, Hasher};
 use std::iter::{Peekable, empty, once};
 use std::marker::PhantomData;
@@ -41,6 +43,855 @@ use std::{fmt, io};
 
 type InternalTupleEvaluator<'a, T> =
     Rc<dyn Fn(InternalTuple<T>) -> InternalTuplesIterator<'a, T> + 'a>;
+
+const DEFAULT_TRANSITIVE_PATH_CACHE_MAX_EDGES: usize = 5_000_000;
+const DEFAULT_TRANSITIVE_PATH_CACHE_MAX_CLOSURES: usize = 200_000;
+const DEFAULT_TRANSITIVE_PATH_CACHE_MAX_REACHABILITY: usize = 500_000;
+const DEFAULT_TRANSITIVE_PATH_CACHE_MAX_PAIRS: usize = 20_000_000;
+const DEFAULT_TRANSITIVE_PATH_CACHE_MAX_GRAPH_NODES: usize = 2_000_000;
+const TRANSITIVE_PATH_MEMBERSHIP_MIN_SIZE: usize = 64;
+const DEFAULT_QUAD_PATTERN_CACHE_MAX_ENTRIES: usize = 100_000;
+const DEFAULT_QUAD_PATTERN_CACHE_MAX_RESULTS: usize = 50_000;
+const DEFAULT_QUAD_PATTERN_DEFAULT_GRAPH_INDEX_MAX_QUADS: usize = 2_000_000;
+const DEFAULT_QUAD_PATTERN_DEFAULT_GRAPH_SUBJECT_INDEX_ENABLED: bool = false;
+const DEFAULT_EXISTS_CACHE_MAX_ENTRIES: usize = 200_000;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TransitivePathStatsSnapshot {
+    pub transitive_index_builds: usize,
+    pub transitive_closure_cache_hits: usize,
+    pub transitive_closure_cache_misses: usize,
+    pub transitive_reachability_tests: usize,
+    pub transitive_enumerations: usize,
+}
+
+#[derive(Default)]
+struct TransitivePathStats {
+    transitive_index_builds: Cell<usize>,
+    transitive_closure_cache_hits: Cell<usize>,
+    transitive_closure_cache_misses: Cell<usize>,
+    transitive_reachability_tests: Cell<usize>,
+    transitive_enumerations: Cell<usize>,
+}
+
+impl TransitivePathStats {
+    fn snapshot(&self) -> TransitivePathStatsSnapshot {
+        TransitivePathStatsSnapshot {
+            transitive_index_builds: self.transitive_index_builds.get(),
+            transitive_closure_cache_hits: self.transitive_closure_cache_hits.get(),
+            transitive_closure_cache_misses: self.transitive_closure_cache_misses.get(),
+            transitive_reachability_tests: self.transitive_reachability_tests.get(),
+            transitive_enumerations: self.transitive_enumerations.get(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TransitivePathDirection {
+    Forward,
+    Reverse,
+}
+
+impl TransitivePathDirection {
+    fn opposite(self) -> Self {
+        match self {
+            Self::Forward => Self::Reverse,
+            Self::Reverse => Self::Forward,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TransitivePathKind {
+    ZeroOrMore,
+    OneOrMore,
+}
+
+#[derive(Clone, Eq, PartialEq, Hash)]
+struct TransitivePathIndexKey<T> {
+    graph_name: Option<T>,
+    predicate: T,
+}
+
+struct TransitivePredicateIndex<T> {
+    forward_adj: FxHashMap<T, Vec<T>>,
+    reverse_adj: FxHashMap<T, Vec<T>>,
+    forward_plus_cache: FxHashMap<T, Arc<[T]>>,
+    reverse_plus_cache: FxHashMap<T, Arc<[T]>>,
+    forward_plus_membership_cache: FxHashMap<T, Arc<FxHashSet<T>>>,
+    reverse_plus_membership_cache: FxHashMap<T, Arc<FxHashSet<T>>>,
+    forward_plus_order: VecDeque<T>,
+    reverse_plus_order: VecDeque<T>,
+    forward_plus_membership_order: VecDeque<T>,
+    reverse_plus_membership_order: VecDeque<T>,
+    forward_plus_pairs_cache: Option<Arc<[(T, T)]>>,
+    reverse_plus_pairs_cache: Option<Arc<[(T, T)]>>,
+    forward_plus_pairs_disabled: bool,
+    reverse_plus_pairs_disabled: bool,
+    forward_reachability_cache: FxHashMap<(T, T), bool>,
+    reverse_reachability_cache: FxHashMap<(T, T), bool>,
+    forward_reachability_order: VecDeque<(T, T)>,
+    reverse_reachability_order: VecDeque<(T, T)>,
+    disabled: bool,
+}
+
+impl<T> Default for TransitivePredicateIndex<T> {
+    fn default() -> Self {
+        Self {
+            forward_adj: FxHashMap::default(),
+            reverse_adj: FxHashMap::default(),
+            forward_plus_cache: FxHashMap::default(),
+            reverse_plus_cache: FxHashMap::default(),
+            forward_plus_membership_cache: FxHashMap::default(),
+            reverse_plus_membership_cache: FxHashMap::default(),
+            forward_plus_order: VecDeque::default(),
+            reverse_plus_order: VecDeque::default(),
+            forward_plus_membership_order: VecDeque::default(),
+            reverse_plus_membership_order: VecDeque::default(),
+            forward_plus_pairs_cache: None,
+            reverse_plus_pairs_cache: None,
+            forward_plus_pairs_disabled: false,
+            reverse_plus_pairs_disabled: false,
+            forward_reachability_cache: FxHashMap::default(),
+            reverse_reachability_cache: FxHashMap::default(),
+            forward_reachability_order: VecDeque::default(),
+            reverse_reachability_order: VecDeque::default(),
+            disabled: false,
+        }
+    }
+}
+
+impl<T: Clone + Eq + Hash> TransitivePredicateIndex<T> {
+    fn disabled() -> Self {
+        Self {
+            disabled: true,
+            ..Self::default()
+        }
+    }
+
+    fn plus_closure(
+        &mut self,
+        start: &T,
+        direction: TransitivePathDirection,
+        stats: &TransitivePathStats,
+        max_cached_closures: usize,
+    ) -> Option<Arc<[T]>> {
+        if self.disabled {
+            return None;
+        }
+        let (adj, cache, cache_order, membership_cache) = match direction {
+            TransitivePathDirection::Forward => (
+                &self.forward_adj,
+                &mut self.forward_plus_cache,
+                &mut self.forward_plus_order,
+                &mut self.forward_plus_membership_cache,
+            ),
+            TransitivePathDirection::Reverse => (
+                &self.reverse_adj,
+                &mut self.reverse_plus_cache,
+                &mut self.reverse_plus_order,
+                &mut self.reverse_plus_membership_cache,
+            ),
+        };
+        if let Some(result) = cache.get(start) {
+            stats
+                .transitive_closure_cache_hits
+                .set(stats.transitive_closure_cache_hits.get().saturating_add(1));
+            return Some(Arc::clone(result));
+        }
+        stats.transitive_closure_cache_misses.set(
+            stats
+                .transitive_closure_cache_misses
+                .get()
+                .saturating_add(1),
+        );
+        let mut todo = Vec::new();
+        if let Some(next) = adj.get(start) {
+            // We push in reverse order to preserve deterministic visit order with a LIFO stack.
+            for value in next.iter().rev() {
+                todo.push(value.clone());
+            }
+        }
+        let mut visited = FxHashSet::default();
+        let mut closure = Vec::new();
+        while let Some(term) = todo.pop() {
+            if visited.insert(term.clone()) {
+                closure.push(term.clone());
+                if let Some(cached_suffix) = cache.get(&term) {
+                    stats
+                        .transitive_closure_cache_hits
+                        .set(stats.transitive_closure_cache_hits.get().saturating_add(1));
+                    for cached_term in cached_suffix.iter() {
+                        if visited.insert(cached_term.clone()) {
+                            closure.push(cached_term.clone());
+                        }
+                    }
+                    continue;
+                }
+                if let Some(next) = adj.get(&term) {
+                    for value in next.iter().rev() {
+                        if !visited.contains(value) {
+                            todo.push(value.clone());
+                        }
+                    }
+                }
+            }
+        }
+        let closure: Arc<[T]> = closure.into();
+        if max_cached_closures > 0 {
+            while cache.len() >= max_cached_closures {
+                if let Some(evicted) = cache_order.pop_front() {
+                    cache.remove(&evicted);
+                    membership_cache.remove(&evicted);
+                } else {
+                    break;
+                }
+            }
+            cache_order.push_back(start.clone());
+            cache.insert(start.clone(), Arc::clone(&closure));
+        }
+        Some(closure)
+    }
+
+    fn plus_pairs(
+        &mut self,
+        direction: TransitivePathDirection,
+        stats: &TransitivePathStats,
+        max_cached_closures: usize,
+        max_pairs: usize,
+    ) -> Option<Arc<[(T, T)]>> {
+        if self.disabled {
+            return None;
+        }
+        if max_pairs == 0 {
+            return None;
+        }
+        if match direction {
+            TransitivePathDirection::Forward => self.forward_plus_pairs_disabled,
+            TransitivePathDirection::Reverse => self.reverse_plus_pairs_disabled,
+        } {
+            return None;
+        }
+        if let Some(cached) = match direction {
+            TransitivePathDirection::Forward => self.forward_plus_pairs_cache.as_ref(),
+            TransitivePathDirection::Reverse => self.reverse_plus_pairs_cache.as_ref(),
+        } {
+            stats
+                .transitive_closure_cache_hits
+                .set(stats.transitive_closure_cache_hits.get().saturating_add(1));
+            return Some(Arc::clone(cached));
+        }
+        stats.transitive_closure_cache_misses.set(
+            stats
+                .transitive_closure_cache_misses
+                .get()
+                .saturating_add(1),
+        );
+        let starts = match direction {
+            TransitivePathDirection::Forward => {
+                self.forward_adj.keys().cloned().collect::<Vec<_>>()
+            }
+            TransitivePathDirection::Reverse => {
+                self.reverse_adj.keys().cloned().collect::<Vec<_>>()
+            }
+        };
+        let mut pairs = Vec::new();
+        for start in starts {
+            let closure = self.plus_closure(&start, direction, stats, max_cached_closures)?;
+            for end in closure.iter() {
+                if pairs.len() >= max_pairs {
+                    match direction {
+                        TransitivePathDirection::Forward => {
+                            self.forward_plus_pairs_disabled = true;
+                        }
+                        TransitivePathDirection::Reverse => {
+                            self.reverse_plus_pairs_disabled = true;
+                        }
+                    }
+                    return None;
+                }
+                pairs.push((start.clone(), end.clone()));
+            }
+        }
+        let pairs: Arc<[(T, T)]> = pairs.into();
+        match direction {
+            TransitivePathDirection::Forward => {
+                self.forward_plus_pairs_cache = Some(Arc::clone(&pairs));
+            }
+            TransitivePathDirection::Reverse => {
+                self.reverse_plus_pairs_cache = Some(Arc::clone(&pairs));
+            }
+        }
+        Some(pairs)
+    }
+
+    fn plus_reachable(
+        &mut self,
+        start: &T,
+        end: &T,
+        direction: TransitivePathDirection,
+        stats: &TransitivePathStats,
+        max_cached_closures: usize,
+        max_cached_reachability: usize,
+    ) -> Option<bool> {
+        if self.disabled {
+            return None;
+        }
+        let key = (start.clone(), end.clone());
+        {
+            let reachability_cache = match direction {
+                TransitivePathDirection::Forward => &mut self.forward_reachability_cache,
+                TransitivePathDirection::Reverse => &mut self.reverse_reachability_cache,
+            };
+            if let Some(result) = reachability_cache.get(&key) {
+                stats
+                    .transitive_closure_cache_hits
+                    .set(stats.transitive_closure_cache_hits.get().saturating_add(1));
+                return Some(*result);
+            }
+        }
+        stats.transitive_closure_cache_misses.set(
+            stats
+                .transitive_closure_cache_misses
+                .get()
+                .saturating_add(1),
+        );
+        let closure = self.plus_closure(start, direction, stats, max_cached_closures)?;
+        let result = if closure.len() < TRANSITIVE_PATH_MEMBERSHIP_MIN_SIZE {
+            closure.contains(end)
+        } else {
+            let (membership_cache, membership_order) = match direction {
+                TransitivePathDirection::Forward => (
+                    &mut self.forward_plus_membership_cache,
+                    &mut self.forward_plus_membership_order,
+                ),
+                TransitivePathDirection::Reverse => (
+                    &mut self.reverse_plus_membership_cache,
+                    &mut self.reverse_plus_membership_order,
+                ),
+            };
+            if let Some(membership) = membership_cache.get(start) {
+                membership.contains(end)
+            } else {
+                let membership = Arc::new(closure.iter().cloned().collect::<FxHashSet<_>>());
+                if max_cached_closures > 0 {
+                    while membership_cache.len() >= max_cached_closures {
+                        if let Some(evicted) = membership_order.pop_front() {
+                            membership_cache.remove(&evicted);
+                        } else {
+                            break;
+                        }
+                    }
+                    membership_order.push_back(start.clone());
+                    membership_cache.insert(start.clone(), Arc::clone(&membership));
+                }
+                membership.contains(end)
+            }
+        };
+        if max_cached_reachability > 0 {
+            let (reachability_cache, reachability_order) = match direction {
+                TransitivePathDirection::Forward => (
+                    &mut self.forward_reachability_cache,
+                    &mut self.forward_reachability_order,
+                ),
+                TransitivePathDirection::Reverse => (
+                    &mut self.reverse_reachability_cache,
+                    &mut self.reverse_reachability_order,
+                ),
+            };
+            while reachability_cache.len() >= max_cached_reachability {
+                if let Some(evicted) = reachability_order.pop_front() {
+                    reachability_cache.remove(&evicted);
+                } else {
+                    break;
+                }
+            }
+            reachability_order.push_back(key.clone());
+            reachability_cache.insert(key, result);
+        }
+        Some(result)
+    }
+}
+
+struct TransitivePathCache<T> {
+    enabled: bool,
+    max_edges: usize,
+    max_closures_per_index: usize,
+    max_reachability_per_index: usize,
+    max_pairs_per_index: usize,
+    max_graph_nodes_per_graph: usize,
+    indexes: FxHashMap<TransitivePathIndexKey<T>, TransitivePredicateIndex<T>>,
+    graph_nodes: FxHashMap<Option<T>, Arc<[T]>>,
+    graph_nodes_disabled: FxHashSet<Option<T>>,
+    stats: Rc<TransitivePathStats>,
+}
+
+impl<T: Clone + Eq + Hash> TransitivePathCache<T> {
+    fn new(stats: Rc<TransitivePathStats>) -> Self {
+        Self {
+            enabled: transitive_path_cache_enabled_from_env(),
+            max_edges: transitive_path_cache_max_edges_from_env(),
+            max_closures_per_index: transitive_path_cache_max_closures_from_env(),
+            max_reachability_per_index: transitive_path_cache_max_reachability_from_env(),
+            max_pairs_per_index: transitive_path_cache_max_pairs_from_env(),
+            max_graph_nodes_per_graph: transitive_path_cache_max_graph_nodes_from_env(),
+            indexes: FxHashMap::default(),
+            graph_nodes: FxHashMap::default(),
+            graph_nodes_disabled: FxHashSet::default(),
+            stats,
+        }
+    }
+}
+
+#[derive(Clone, Eq, PartialEq, Hash)]
+struct QuadPatternCacheKey<T> {
+    subject: Option<T>,
+    predicate: Option<T>,
+    object: Option<T>,
+    graph_name: Option<Option<T>>,
+}
+
+#[derive(Clone, Eq, PartialEq, Hash)]
+struct ExistsCacheKey<T> {
+    evaluator_id: usize,
+    bindings: Vec<Option<T>>,
+}
+
+struct QuadPatternCache<T> {
+    enabled: bool,
+    max_entries: usize,
+    max_results_per_entry: usize,
+    default_graph_subject_index_enabled: bool,
+    max_default_graph_index_quads: usize,
+    entries: FxHashMap<QuadPatternCacheKey<T>, Arc<[InternalQuad<T>]>>,
+    default_graph_subject_index: Option<FxHashMap<T, Arc<[InternalQuad<T>]>>>,
+    default_graph_subject_index_disabled: bool,
+    hits: Cell<usize>,
+    misses: Cell<usize>,
+    bypassed: Cell<usize>,
+}
+
+struct ExistsCache<T> {
+    enabled: bool,
+    max_entries: usize,
+    entries: FxHashMap<ExistsCacheKey<T>, bool>,
+    unary_entries: FxHashMap<(usize, Option<T>), bool>,
+    hits: Cell<usize>,
+    misses: Cell<usize>,
+    bypassed: Cell<usize>,
+}
+
+impl<T: Clone + Eq + Hash> QuadPatternCache<T> {
+    fn new() -> Self {
+        Self {
+            enabled: quad_pattern_cache_enabled_from_env(),
+            max_entries: quad_pattern_cache_max_entries_from_env(),
+            max_results_per_entry: quad_pattern_cache_max_results_from_env(),
+            default_graph_subject_index_enabled:
+                quad_pattern_default_graph_subject_index_enabled_from_env(),
+            max_default_graph_index_quads: quad_pattern_default_graph_index_max_quads_from_env(),
+            entries: FxHashMap::default(),
+            default_graph_subject_index: None,
+            default_graph_subject_index_disabled: false,
+            hits: Cell::new(0),
+            misses: Cell::new(0),
+            bypassed: Cell::new(0),
+        }
+    }
+
+    fn should_cache_lookup(&self, key: &QuadPatternCacheKey<T>, graph_bound: bool) -> bool {
+        self.enabled
+            && graph_bound
+            && (key.subject.is_some() || (key.predicate.is_some() && key.object.is_some()))
+    }
+
+    fn get(&self, key: &QuadPatternCacheKey<T>) -> Option<Arc<[InternalQuad<T>]>> {
+        if let Some(value) = self.entries.get(key) {
+            self.hits.set(self.hits.get().saturating_add(1));
+            Some(Arc::clone(value))
+        } else {
+            self.misses.set(self.misses.get().saturating_add(1));
+            None
+        }
+    }
+
+    fn note_bypass(&self) {
+        self.bypassed.set(self.bypassed.get().saturating_add(1));
+    }
+
+    fn maybe_insert(&mut self, key: QuadPatternCacheKey<T>, results: Arc<[InternalQuad<T>]>) {
+        if self.entries.contains_key(&key) {
+            return;
+        }
+        if self.entries.len() >= self.max_entries || results.len() > self.max_results_per_entry {
+            self.note_bypass();
+            return;
+        }
+        self.entries.insert(key, results);
+    }
+}
+
+impl<T: Clone + Eq + Hash> ExistsCache<T> {
+    fn new() -> Self {
+        Self {
+            enabled: exists_cache_enabled_from_env(),
+            max_entries: exists_cache_max_entries_from_env(),
+            entries: FxHashMap::default(),
+            unary_entries: FxHashMap::default(),
+            hits: Cell::new(0),
+            misses: Cell::new(0),
+            bypassed: Cell::new(0),
+        }
+    }
+
+    fn total_entries(&self) -> usize {
+        self.entries.len().saturating_add(self.unary_entries.len())
+    }
+
+    fn get(&self, key: &ExistsCacheKey<T>) -> Option<bool> {
+        if let Some(value) = self.entries.get(key) {
+            self.hits.set(self.hits.get().saturating_add(1));
+            Some(*value)
+        } else {
+            self.misses.set(self.misses.get().saturating_add(1));
+            None
+        }
+    }
+
+    fn get_unary(&self, evaluator_id: usize, binding: &Option<T>) -> Option<bool> {
+        if let Some(value) = self.unary_entries.get(&(evaluator_id, binding.clone())) {
+            self.hits.set(self.hits.get().saturating_add(1));
+            Some(*value)
+        } else {
+            self.misses.set(self.misses.get().saturating_add(1));
+            None
+        }
+    }
+
+    fn note_bypass(&self) {
+        self.bypassed.set(self.bypassed.get().saturating_add(1));
+    }
+
+    fn maybe_insert(&mut self, key: ExistsCacheKey<T>, value: bool) {
+        if self.entries.contains_key(&key) {
+            return;
+        }
+        if self.total_entries() >= self.max_entries {
+            self.note_bypass();
+            return;
+        }
+        self.entries.insert(key, value);
+    }
+
+    fn maybe_insert_unary(&mut self, evaluator_id: usize, binding: Option<T>, value: bool) {
+        let key = (evaluator_id, binding);
+        if self.unary_entries.contains_key(&key) {
+            return;
+        }
+        if self.total_entries() >= self.max_entries {
+            self.note_bypass();
+            return;
+        }
+        self.unary_entries.insert(key, value);
+    }
+}
+
+struct ExistsAtomEvaluator<'a, T> {
+    evaluator: InternalTupleEvaluator<'a, T>,
+    variable_indexes: Arc<[usize]>,
+}
+
+impl<T> ExistsAtomEvaluator<'_, T> {
+    fn bound_score(&self, tuple: &InternalTuple<T>) -> usize {
+        self.variable_indexes
+            .iter()
+            .filter(|index| tuple.contains(**index))
+            .count()
+    }
+}
+
+struct TransitivePathPatternRef<'a, T> {
+    predicate: &'a T,
+    direction: TransitivePathDirection,
+    kind: TransitivePathKind,
+}
+
+fn transitive_path_cache_enabled_from_env() -> bool {
+    env::var("OXIGRAPH_TRANSITIVE_PATH_CACHE").map_or(true, |value| {
+        !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
+}
+
+fn transitive_path_cache_max_edges_from_env() -> usize {
+    env::var("OXIGRAPH_TRANSITIVE_PATH_CACHE_MAX_EDGES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_TRANSITIVE_PATH_CACHE_MAX_EDGES)
+}
+
+fn transitive_path_cache_max_closures_from_env() -> usize {
+    env::var("OXIGRAPH_TRANSITIVE_PATH_CACHE_MAX_CLOSURES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_TRANSITIVE_PATH_CACHE_MAX_CLOSURES)
+}
+
+fn transitive_path_cache_max_reachability_from_env() -> usize {
+    env::var("OXIGRAPH_TRANSITIVE_PATH_CACHE_MAX_REACHABILITY")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_TRANSITIVE_PATH_CACHE_MAX_REACHABILITY)
+}
+
+fn transitive_path_cache_max_pairs_from_env() -> usize {
+    env::var("OXIGRAPH_TRANSITIVE_PATH_CACHE_MAX_PAIRS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_TRANSITIVE_PATH_CACHE_MAX_PAIRS)
+}
+
+fn transitive_path_cache_max_graph_nodes_from_env() -> usize {
+    env::var("OXIGRAPH_TRANSITIVE_PATH_CACHE_MAX_GRAPH_NODES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_TRANSITIVE_PATH_CACHE_MAX_GRAPH_NODES)
+}
+
+fn quad_pattern_cache_enabled_from_env() -> bool {
+    env::var("OXIGRAPH_QUAD_PATTERN_CACHE").map_or(true, |value| {
+        !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
+}
+
+fn quad_pattern_cache_max_entries_from_env() -> usize {
+    env::var("OXIGRAPH_QUAD_PATTERN_CACHE_MAX_ENTRIES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_QUAD_PATTERN_CACHE_MAX_ENTRIES)
+}
+
+fn quad_pattern_cache_max_results_from_env() -> usize {
+    env::var("OXIGRAPH_QUAD_PATTERN_CACHE_MAX_RESULTS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_QUAD_PATTERN_CACHE_MAX_RESULTS)
+}
+
+fn quad_pattern_default_graph_subject_index_enabled_from_env() -> bool {
+    env::var("OXIGRAPH_QUAD_PATTERN_DEFAULT_GRAPH_SUBJECT_INDEX").map_or(
+        DEFAULT_QUAD_PATTERN_DEFAULT_GRAPH_SUBJECT_INDEX_ENABLED,
+        |value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        },
+    )
+}
+
+fn quad_pattern_default_graph_index_max_quads_from_env() -> usize {
+    env::var("OXIGRAPH_QUAD_PATTERN_DEFAULT_GRAPH_INDEX_MAX_QUADS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_QUAD_PATTERN_DEFAULT_GRAPH_INDEX_MAX_QUADS)
+}
+
+fn collect_exists_join_atoms<'a>(
+    pattern: &'a GraphPattern,
+    atoms: &mut Vec<&'a GraphPattern>,
+) -> bool {
+    match pattern {
+        GraphPattern::Join { left, right, .. } => {
+            collect_exists_join_atoms(left, atoms) && collect_exists_join_atoms(right, atoms)
+        }
+        GraphPattern::QuadPattern { .. } | GraphPattern::Path { .. } => {
+            atoms.push(pattern);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn graph_pattern_contains_volatile_expression(pattern: &GraphPattern) -> bool {
+    match pattern {
+        GraphPattern::Values { .. }
+        | GraphPattern::QuadPattern { .. }
+        | GraphPattern::Path { .. }
+        | GraphPattern::Graph { .. } => false,
+        GraphPattern::Join { left, right, .. } | GraphPattern::Minus { left, right, .. } => {
+            graph_pattern_contains_volatile_expression(left)
+                || graph_pattern_contains_volatile_expression(right)
+        }
+        GraphPattern::LeftJoin {
+            left,
+            right,
+            expression,
+            ..
+        } => {
+            graph_pattern_contains_volatile_expression(left)
+                || graph_pattern_contains_volatile_expression(right)
+                || expression_contains_volatile_function(expression)
+        }
+        #[cfg(feature = "sep-0006")]
+        GraphPattern::Lateral { left, right } => {
+            graph_pattern_contains_volatile_expression(left)
+                || graph_pattern_contains_volatile_expression(right)
+        }
+        GraphPattern::Filter { inner, expression }
+        | GraphPattern::Extend {
+            inner, expression, ..
+        } => {
+            graph_pattern_contains_volatile_expression(inner)
+                || expression_contains_volatile_function(expression)
+        }
+        GraphPattern::Union { inner } => {
+            inner.iter().any(graph_pattern_contains_volatile_expression)
+        }
+        GraphPattern::OrderBy { inner, expression } => {
+            graph_pattern_contains_volatile_expression(inner)
+                || expression.iter().any(|expression| match expression {
+                    OrderExpression::Asc(expression) | OrderExpression::Desc(expression) => {
+                        expression_contains_volatile_function(expression)
+                    }
+                })
+        }
+        GraphPattern::Project { inner, .. }
+        | GraphPattern::Distinct { inner }
+        | GraphPattern::Reduced { inner }
+        | GraphPattern::Slice { inner, .. } => graph_pattern_contains_volatile_expression(inner),
+        GraphPattern::Group {
+            inner, aggregates, ..
+        } => {
+            graph_pattern_contains_volatile_expression(inner)
+                || aggregates.iter().any(|(_, aggregate)| {
+                    aggregate_expression_contains_volatile_function(aggregate)
+                })
+        }
+        GraphPattern::Service { inner, .. } => graph_pattern_contains_volatile_expression(inner),
+    }
+}
+
+fn aggregate_expression_contains_volatile_function(expression: &AggregateExpression) -> bool {
+    match expression {
+        AggregateExpression::CountSolutions { .. } => false,
+        AggregateExpression::FunctionCall { expr, .. } => {
+            expression_contains_volatile_function(expr)
+        }
+    }
+}
+
+fn expression_contains_volatile_function(expression: &Expression) -> bool {
+    match expression {
+        Expression::NamedNode(_)
+        | Expression::Literal(_)
+        | Expression::Variable(_)
+        | Expression::Bound(_) => false,
+        Expression::Or(inner) | Expression::And(inner) | Expression::Coalesce(inner) => {
+            inner.iter().any(expression_contains_volatile_function)
+        }
+        Expression::Equal(a, b)
+        | Expression::SameTerm(a, b)
+        | Expression::Greater(a, b)
+        | Expression::GreaterOrEqual(a, b)
+        | Expression::Less(a, b)
+        | Expression::LessOrEqual(a, b)
+        | Expression::Add(a, b)
+        | Expression::Subtract(a, b)
+        | Expression::Multiply(a, b)
+        | Expression::Divide(a, b) => {
+            expression_contains_volatile_function(a) || expression_contains_volatile_function(b)
+        }
+        Expression::UnaryPlus(e) | Expression::UnaryMinus(e) | Expression::Not(e) => {
+            expression_contains_volatile_function(e)
+        }
+        Expression::Exists(inner) => graph_pattern_contains_volatile_expression(inner),
+        Expression::If(a, b, c) => {
+            expression_contains_volatile_function(a)
+                || expression_contains_volatile_function(b)
+                || expression_contains_volatile_function(c)
+        }
+        Expression::FunctionCall(function, arguments) => {
+            is_volatile_function(function, arguments.len())
+                || arguments.iter().any(expression_contains_volatile_function)
+        }
+    }
+}
+
+fn is_volatile_function(function: &Function, arity: usize) -> bool {
+    matches!(
+        function,
+        Function::Rand | Function::Uuid | Function::StrUuid | Function::Custom(_)
+    ) || matches!(function, Function::BNode if arity == 0)
+}
+
+fn exists_with_atom_evaluators<'a, T: Clone + 'a>(
+    atoms: &[ExistsAtomEvaluator<'a, T>],
+    tuple: InternalTuple<T>,
+) -> bool {
+    let remaining = (0..atoms.len()).collect::<Vec<_>>();
+    exists_with_atom_evaluators_recursive(atoms, tuple, &remaining)
+}
+
+fn exists_with_atom_evaluators_recursive<'a, T: Clone + 'a>(
+    atoms: &[ExistsAtomEvaluator<'a, T>],
+    tuple: InternalTuple<T>,
+    remaining: &[usize],
+) -> bool {
+    if remaining.is_empty() {
+        return true;
+    }
+    let mut best_pos = 0;
+    let mut best_score = 0;
+    for (position, atom_index) in remaining.iter().enumerate() {
+        let score = atoms[*atom_index].bound_score(&tuple);
+        if position == 0 || score > best_score {
+            best_pos = position;
+            best_score = score;
+        }
+    }
+    let atom_index = remaining[best_pos];
+    let mut next_remaining = Vec::with_capacity(remaining.len().saturating_sub(1));
+    next_remaining.extend_from_slice(&remaining[..best_pos]);
+    next_remaining.extend_from_slice(&remaining[best_pos + 1..]);
+    for candidate in (atoms[atom_index].evaluator)(tuple.clone()) {
+        match candidate {
+            Ok(next_tuple) => {
+                if exists_with_atom_evaluators_recursive(atoms, next_tuple, &next_remaining) {
+                    return true;
+                }
+            }
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
+fn exists_cache_enabled_from_env() -> bool {
+    env::var("OXIGRAPH_EXISTS_CACHE").map_or(true, |value| {
+        !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
+}
+
+fn exists_cache_max_entries_from_env() -> usize {
+    env::var("OXIGRAPH_EXISTS_CACHE_MAX_ENTRIES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_EXISTS_CACHE_MAX_ENTRIES)
+}
 
 /// Wrapper on top of [`QueryableDataset`]
 struct EvalDataset<'a, D: QueryableDataset<'a>> {
@@ -419,6 +1270,11 @@ pub struct SimpleEvaluator<'a, D: QueryableDataset<'a>> {
     custom_functions: Rc<CustomFunctionRegistry>,
     custom_aggregate_functions: Rc<CustomAggregateFunctionRegistry>,
     run_stats: bool,
+    transitive_path_stats: Rc<TransitivePathStats>,
+    transitive_path_cache: Rc<RefCell<TransitivePathCache<D::InternalTerm>>>,
+    quad_pattern_cache: Rc<RefCell<QuadPatternCache<D::InternalTerm>>>,
+    exists_cache: Rc<RefCell<ExistsCache<D::InternalTerm>>>,
+    next_exists_evaluator_id: Rc<Cell<usize>>,
 }
 
 impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
@@ -432,6 +1288,7 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
         dataset_spec: QueryDatasetSpecification,
         run_stats: bool,
     ) -> Result<Self, QueryEvaluationError> {
+        let transitive_path_stats = Rc::new(TransitivePathStats::default());
         Ok(Self {
             dataset: EvalDataset::new(dataset, dataset_spec, cancellation_token)?,
             base_iri,
@@ -440,7 +1297,18 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
             custom_functions,
             custom_aggregate_functions,
             run_stats,
+            transitive_path_cache: Rc::new(RefCell::new(TransitivePathCache::new(Rc::clone(
+                &transitive_path_stats,
+            )))),
+            transitive_path_stats,
+            quad_pattern_cache: Rc::new(RefCell::new(QuadPatternCache::new())),
+            exists_cache: Rc::new(RefCell::new(ExistsCache::new())),
+            next_exists_evaluator_id: Rc::new(Cell::new(0)),
         })
+    }
+
+    pub fn transitive_path_stats_snapshot(&self) -> TransitivePathStatsSnapshot {
+        self.transitive_path_stats.snapshot()
     }
 
     pub fn evaluate_select(
@@ -715,6 +1583,7 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                     None
                 };
                 let dataset = self.dataset.clone();
+                let quad_pattern_cache = Rc::clone(&self.quad_pattern_cache);
                 Rc::new(move |from| {
                     let input_subject = match subject_selector.get_pattern_value(
                         &from,
@@ -753,6 +1622,279 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                     } else {
                         Some(None) // default graph
                     };
+                    let cache_key = QuadPatternCacheKey {
+                        subject: input_subject.clone(),
+                        predicate: input_predicate.clone(),
+                        object: input_object.clone(),
+                        graph_name: input_graph_name.clone(),
+                    };
+                    let should_cache = {
+                        let cache = quad_pattern_cache.borrow();
+                        cache.should_cache_lookup(&cache_key, input_graph_name.is_some())
+                    };
+                    if should_cache {
+                        let from_for_buffered = from.clone();
+                        let to_buffered_tuples = |quads: Arc<[InternalQuad<D::InternalTerm>]>| {
+                            let subject_selector = subject_selector.clone();
+                            let predicate_selector = predicate_selector.clone();
+                            let object_selector = object_selector.clone();
+                            let graph_name_selector = graph_name_selector.clone();
+                            #[cfg(feature = "sparql-12")]
+                            let dataset = dataset.clone();
+                            let from = from_for_buffered.clone();
+                            quads
+                                .iter()
+                                .map(move |quad| {
+                                    let mut new_tuple = from.clone();
+                                    if !put_pattern_value::<D>(
+                                        &subject_selector,
+                                        quad.subject.clone(),
+                                        &mut new_tuple,
+                                        #[cfg(feature = "sparql-12")]
+                                        &dataset,
+                                    )? {
+                                        return Ok(None);
+                                    }
+                                    if !put_pattern_value::<D>(
+                                        &predicate_selector,
+                                        quad.predicate.clone(),
+                                        &mut new_tuple,
+                                        #[cfg(feature = "sparql-12")]
+                                        &dataset,
+                                    )? {
+                                        return Ok(None);
+                                    }
+                                    if !put_pattern_value::<D>(
+                                        &object_selector,
+                                        quad.object.clone(),
+                                        &mut new_tuple,
+                                        #[cfg(feature = "sparql-12")]
+                                        &dataset,
+                                    )? {
+                                        return Ok(None);
+                                    }
+                                    if let Some(graph_name_selector) = &graph_name_selector {
+                                        let Some(quad_graph_name) = quad.graph_name.clone() else {
+                                            return Err(
+                                                QueryEvaluationError::UnexpectedDefaultGraph,
+                                            );
+                                        };
+                                        if !put_pattern_value::<D>(
+                                            graph_name_selector,
+                                            quad_graph_name,
+                                            &mut new_tuple,
+                                            #[cfg(feature = "sparql-12")]
+                                            &dataset,
+                                        )? {
+                                            return Ok(None);
+                                        }
+                                    }
+                                    Ok(Some(new_tuple))
+                                })
+                                .filter_map(Result::transpose)
+                                .collect::<Vec<_>>()
+                        };
+
+                        if input_graph_name == Some(None) && input_subject.is_some() {
+                            let should_build_default_graph_subject_index = {
+                                let cache = quad_pattern_cache.borrow();
+                                cache.default_graph_subject_index_enabled
+                                    && !cache.default_graph_subject_index_disabled
+                                    && cache.default_graph_subject_index.is_none()
+                            };
+                            if should_build_default_graph_subject_index {
+                                let max_index_quads = {
+                                    let cache = quad_pattern_cache.borrow();
+                                    cache.max_default_graph_index_quads
+                                };
+                                let mut by_subject: FxHashMap<
+                                    D::InternalTerm,
+                                    Vec<InternalQuad<D::InternalTerm>>,
+                                > = FxHashMap::default();
+                                let mut quad_count = 0_usize;
+                                let mut disable_index = false;
+                                for quad in
+                                    dataset.internal_quads_for_pattern(None, None, None, Some(None))
+                                {
+                                    let quad = match quad {
+                                        Ok(quad) => quad,
+                                        Err(error) => return Box::new(once(Err(error))),
+                                    };
+                                    quad_count = quad_count.saturating_add(1);
+                                    if quad_count > max_index_quads {
+                                        disable_index = true;
+                                        break;
+                                    }
+                                    by_subject
+                                        .entry(quad.subject.clone())
+                                        .or_default()
+                                        .push(quad);
+                                }
+                                let mut cache = quad_pattern_cache.borrow_mut();
+                                if disable_index {
+                                    cache.default_graph_subject_index_disabled = true;
+                                    cache.note_bypass();
+                                } else {
+                                    cache.default_graph_subject_index = Some(
+                                        by_subject
+                                            .into_iter()
+                                            .map(|(subject, quads)| {
+                                                (
+                                                    subject,
+                                                    Arc::<[InternalQuad<D::InternalTerm>]>::from(
+                                                        quads,
+                                                    ),
+                                                )
+                                            })
+                                            .collect(),
+                                    );
+                                }
+                            }
+                            let indexed_subject_quads = {
+                                let cache = quad_pattern_cache.borrow();
+                                input_subject.as_ref().and_then(|subject| {
+                                    cache
+                                        .default_graph_subject_index
+                                        .as_ref()
+                                        .and_then(|index| index.get(subject))
+                                        .cloned()
+                                })
+                            };
+                            if let Some(indexed_subject_quads) = indexed_subject_quads {
+                                let filtered_quads: Arc<[InternalQuad<D::InternalTerm>]> =
+                                    indexed_subject_quads
+                                        .iter()
+                                        .filter(|quad| {
+                                            input_predicate.as_ref().is_none_or(|predicate| {
+                                                predicate == &quad.predicate
+                                            }) && input_object
+                                                .as_ref()
+                                                .is_none_or(|object| object == &quad.object)
+                                        })
+                                        .map(|quad| InternalQuad {
+                                            subject: quad.subject.clone(),
+                                            predicate: quad.predicate.clone(),
+                                            object: quad.object.clone(),
+                                            graph_name: quad.graph_name.clone(),
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .into();
+                                {
+                                    let mut cache = quad_pattern_cache.borrow_mut();
+                                    cache.maybe_insert(
+                                        cache_key.clone(),
+                                        Arc::clone(&filtered_quads),
+                                    );
+                                }
+                                return Box::new(to_buffered_tuples(filtered_quads).into_iter());
+                            }
+                        }
+
+                        let cached = {
+                            let cache = quad_pattern_cache.borrow();
+                            cache.get(&cache_key)
+                        };
+                        if let Some(cached_quads) = cached {
+                            return Box::new(to_buffered_tuples(cached_quads).into_iter());
+                        }
+                        let max_results_per_entry = {
+                            let cache = quad_pattern_cache.borrow();
+                            cache.max_results_per_entry
+                        };
+                        let mut collected_quads = Vec::new();
+                        let mut quad_iter = dataset.internal_quads_for_pattern(
+                            input_subject.as_ref(),
+                            input_predicate.as_ref(),
+                            input_object.as_ref(),
+                            input_graph_name.as_ref().map(|g| g.as_ref()),
+                        );
+                        while let Some(quad) = quad_iter.next() {
+                            let quad = match quad {
+                                Ok(quad) => quad,
+                                Err(error) => return Box::new(once(Err(error))),
+                            };
+                            if collected_quads.len() >= max_results_per_entry {
+                                {
+                                    let cache = quad_pattern_cache.borrow();
+                                    cache.note_bypass();
+                                }
+                                let iter = collected_quads
+                                    .into_iter()
+                                    .map(Ok)
+                                    .chain(once(Ok(quad)))
+                                    .chain(quad_iter);
+                                let subject_selector = subject_selector.clone();
+                                let predicate_selector = predicate_selector.clone();
+                                let object_selector = object_selector.clone();
+                                let graph_name_selector = graph_name_selector.clone();
+                                #[cfg(feature = "sparql-12")]
+                                let dataset = dataset.clone();
+                                return Box::new(
+                                    iter.map(move |quad| {
+                                        let quad = quad?;
+                                        let mut new_tuple = from.clone();
+                                        if !put_pattern_value::<D>(
+                                            &subject_selector,
+                                            quad.subject,
+                                            &mut new_tuple,
+                                            #[cfg(feature = "sparql-12")]
+                                            &dataset,
+                                        )? {
+                                            return Ok(None);
+                                        }
+                                        if !put_pattern_value::<D>(
+                                            &predicate_selector,
+                                            quad.predicate,
+                                            &mut new_tuple,
+                                            #[cfg(feature = "sparql-12")]
+                                            &dataset,
+                                        )? {
+                                            return Ok(None);
+                                        }
+                                        if !put_pattern_value::<D>(
+                                            &object_selector,
+                                            quad.object,
+                                            &mut new_tuple,
+                                            #[cfg(feature = "sparql-12")]
+                                            &dataset,
+                                        )? {
+                                            return Ok(None);
+                                        }
+                                        if let Some(graph_name_selector) = &graph_name_selector {
+                                            let Some(quad_graph_name) = quad.graph_name else {
+                                                return Err(
+                                                    QueryEvaluationError::UnexpectedDefaultGraph,
+                                                );
+                                            };
+                                            if !put_pattern_value::<D>(
+                                                graph_name_selector,
+                                                quad_graph_name,
+                                                &mut new_tuple,
+                                                #[cfg(feature = "sparql-12")]
+                                                &dataset,
+                                            )? {
+                                                return Ok(None);
+                                            }
+                                        }
+                                        Ok(Some(new_tuple))
+                                    })
+                                    .filter_map(Result::transpose),
+                                );
+                            }
+                            collected_quads.push(quad);
+                        }
+                        let collected_quads: Arc<[InternalQuad<D::InternalTerm>]> =
+                            collected_quads.into();
+                        {
+                            let mut cache = quad_pattern_cache.borrow_mut();
+                            cache.maybe_insert(cache_key, Arc::clone(&collected_quads));
+                        }
+                        return Box::new(to_buffered_tuples(collected_quads).into_iter());
+                    }
+                    {
+                        let cache = quad_pattern_cache.borrow();
+                        cache.note_bypass();
+                    }
                     let iter = dataset.internal_quads_for_pattern(
                         input_subject.as_ref(),
                         input_predicate.as_ref(),
@@ -843,7 +1985,13 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                     None
                 };
                 let dataset = self.dataset.clone();
+                let transitive_path_cache = Rc::clone(&self.transitive_path_cache);
+                let path_eval = PathEvaluator {
+                    dataset: dataset.clone(),
+                    transitive_path_cache: Rc::clone(&transitive_path_cache),
+                };
                 Rc::new(move |from| {
+                    let path_eval = path_eval.clone();
                     let input_subject = match subject_selector.get_pattern_value(
                         &from,
                         #[cfg(feature = "sparql-12")]
@@ -851,9 +1999,6 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                     ) {
                         Ok(value) => value,
                         Err(e) => return Box::new(once(Err(e))),
-                    };
-                    let path_eval = PathEvaluator {
-                        dataset: dataset.clone(),
                     };
                     let input_object = match object_selector.get_pattern_value(
                         &from,
@@ -1326,12 +2471,15 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                 right,
                 algorithm,
             } => {
+                let ignored_graph_positions =
+                    minus_shared_graph_only_positions(left, right, encoded_variables);
                 let (left, left_stats) = self.graph_pattern_evaluator(left, encoded_variables);
                 stat_children.push(left_stats);
                 let (right, right_stats) = self.graph_pattern_evaluator(right, encoded_variables);
                 stat_children.push(right_stats);
                 let left = left?;
                 let right = right?;
+                let ignored_graph_positions = Rc::<[usize]>::from(ignored_graph_positions);
 
                 match algorithm {
                     MinusAlgorithm::HashBuildRightProbeLeft { keys } => {
@@ -1342,12 +2490,14 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                                 if right.is_empty() {
                                     return left(from);
                                 }
+                                let ignored_graph_positions = Rc::clone(&ignored_graph_positions);
                                 Box::new(left(from).filter(move |left_tuple| {
                                     if let Ok(left_tuple) = left_tuple {
                                         !right.iter().any(|right_tuple| {
-                                            are_compatible_and_not_disjointed(
+                                            are_compatible_and_not_disjointed_ignoring(
                                                 left_tuple,
                                                 right_tuple,
+                                                &ignored_graph_positions,
                                             )
                                         })
                                     } else {
@@ -1366,12 +2516,14 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                                 if right_values.is_empty() {
                                     return left(from);
                                 }
+                                let ignored_graph_positions = Rc::clone(&ignored_graph_positions);
                                 Box::new(left(from).filter(move |left_tuple| {
                                     if let Ok(left_tuple) = left_tuple {
                                         !right_values.get(left_tuple).iter().any(|right_tuple| {
-                                            are_compatible_and_not_disjointed(
+                                            are_compatible_and_not_disjointed_ignoring(
                                                 left_tuple,
                                                 right_tuple,
+                                                &ignored_graph_positions,
                                             )
                                         })
                                     } else {
@@ -2106,6 +3258,11 @@ impl<'a, D: QueryableDataset<'a>> Clone for SimpleEvaluator<'a, D> {
             custom_functions: Rc::clone(&self.custom_functions),
             custom_aggregate_functions: Rc::clone(&self.custom_aggregate_functions),
             run_stats: self.run_stats,
+            transitive_path_stats: Rc::clone(&self.transitive_path_stats),
+            transitive_path_cache: Rc::clone(&self.transitive_path_cache),
+            quad_pattern_cache: Rc::clone(&self.quad_pattern_cache),
+            exists_cache: Rc::clone(&self.exists_cache),
+            next_exists_evaluator_id: Rc::clone(&self.next_exists_evaluator_id),
         }
     }
 }
@@ -2143,12 +3300,138 @@ impl<'a, 'b, D: QueryableDataset<'a>> ExpressionEvaluatorContext<'a>
         &mut self,
         plan: &GraphPattern,
     ) -> Result<impl Fn(&InternalTuple<D::InternalTerm>) -> bool + 'a, QueryEvaluationError> {
-        let (eval, stats) = self
-            .evaluator
-            .graph_pattern_evaluator(plan, self.encoded_variables);
-        self.stat_children.push(stats);
-        let eval = eval?;
-        Ok(move |tuple: &InternalTuple<D::InternalTerm>| eval(tuple.clone()).next().is_some())
+        let outer_variable_count = self.encoded_variables.len();
+        let mut correlated_variable_indexes = Vec::new();
+        plan.lookup_used_variables(&mut |variable| {
+            if let Some(index) = slice_key(self.encoded_variables, variable) {
+                if index < outer_variable_count {
+                    correlated_variable_indexes.push(index);
+                }
+            }
+        });
+        correlated_variable_indexes.sort_unstable();
+        correlated_variable_indexes.dedup();
+        let exists_evaluator_id = self.evaluator.next_exists_evaluator_id.get();
+        self.evaluator
+            .next_exists_evaluator_id
+            .set(exists_evaluator_id.saturating_add(1));
+        let mut join_atoms = Vec::new();
+        let eval_exists: Rc<dyn Fn(&InternalTuple<D::InternalTerm>) -> bool + 'a> =
+            if collect_exists_join_atoms(plan, &mut join_atoms) && join_atoms.len() > 1 {
+                let mut atom_evaluators = Vec::with_capacity(join_atoms.len());
+                for atom in join_atoms {
+                    let (atom_eval, atom_stats) = self
+                        .evaluator
+                        .graph_pattern_evaluator(atom, self.encoded_variables);
+                    self.stat_children.push(atom_stats);
+                    let atom_eval = atom_eval?;
+                    let mut variable_indexes = Vec::new();
+                    atom.lookup_used_variables(&mut |variable| {
+                        if let Some(index) = slice_key(self.encoded_variables, variable) {
+                            variable_indexes.push(index);
+                        }
+                    });
+                    variable_indexes.sort_unstable();
+                    variable_indexes.dedup();
+                    atom_evaluators.push(ExistsAtomEvaluator {
+                        evaluator: atom_eval,
+                        variable_indexes: Arc::from(variable_indexes),
+                    });
+                }
+                let atom_evaluators: Arc<[ExistsAtomEvaluator<'a, D::InternalTerm>]> =
+                    Arc::from(atom_evaluators);
+                Rc::new(move |tuple: &InternalTuple<D::InternalTerm>| {
+                    exists_with_atom_evaluators(atom_evaluators.as_ref(), tuple.clone())
+                })
+            } else {
+                let (eval, stats) = self
+                    .evaluator
+                    .graph_pattern_evaluator(plan, self.encoded_variables);
+                self.stat_children.push(stats);
+                let eval = eval?;
+                Rc::new(move |tuple: &InternalTuple<D::InternalTerm>| {
+                    eval(tuple.clone()).next().is_some()
+                })
+            };
+        let exists_cache = Rc::clone(&self.evaluator.exists_cache);
+        let volatile_exists = graph_pattern_contains_volatile_expression(plan);
+        let use_cache = {
+            let cache = exists_cache.borrow();
+            cache.enabled
+        };
+
+        enum ExistsCacheMode {
+            Disabled,
+            Uncorrelated(Cell<Option<bool>>),
+            Unary(usize),
+            General,
+        }
+
+        let cache_mode = if volatile_exists {
+            ExistsCacheMode::Disabled
+        } else if correlated_variable_indexes.is_empty() {
+            ExistsCacheMode::Uncorrelated(Cell::new(None))
+        } else if correlated_variable_indexes.len() == 1 {
+            ExistsCacheMode::Unary(correlated_variable_indexes[0])
+        } else {
+            ExistsCacheMode::General
+        };
+
+        Ok(
+            move |tuple: &InternalTuple<D::InternalTerm>| match &cache_mode {
+                ExistsCacheMode::Disabled => eval_exists(tuple),
+                ExistsCacheMode::Uncorrelated(result_once) => {
+                    if let Some(cached) = result_once.get() {
+                        return cached;
+                    }
+                    let value = eval_exists(tuple);
+                    result_once.set(Some(value));
+                    value
+                }
+                ExistsCacheMode::Unary(correlated_index) => {
+                    if !use_cache {
+                        return eval_exists(tuple);
+                    }
+                    let binding = tuple.get(*correlated_index).cloned();
+                    if let Some(cached) = {
+                        let cache = exists_cache.borrow();
+                        cache.get_unary(exists_evaluator_id, &binding)
+                    } {
+                        return cached;
+                    }
+                    let value = eval_exists(tuple);
+                    {
+                        let mut cache = exists_cache.borrow_mut();
+                        cache.maybe_insert_unary(exists_evaluator_id, binding, value);
+                    }
+                    value
+                }
+                ExistsCacheMode::General => {
+                    if !use_cache {
+                        return eval_exists(tuple);
+                    }
+                    let key = ExistsCacheKey {
+                        evaluator_id: exists_evaluator_id,
+                        bindings: correlated_variable_indexes
+                            .iter()
+                            .map(|index| tuple.get(*index).cloned())
+                            .collect(),
+                    };
+                    if let Some(cached) = {
+                        let cache = exists_cache.borrow();
+                        cache.get(&key)
+                    } {
+                        return cached;
+                    }
+                    let value = eval_exists(tuple);
+                    {
+                        let mut cache = exists_cache.borrow_mut();
+                        cache.maybe_insert(key, value);
+                    }
+                    value
+                }
+            },
+        )
     }
 
     fn internalize_named_node(
@@ -2929,12 +4212,24 @@ fn put_pattern_value<'a, D: QueryableDataset<'a>>(
     })
 }
 
+#[allow(dead_code)]
 pub fn are_compatible_and_not_disjointed<T: Clone + Eq>(
     a: &InternalTuple<T>,
     b: &InternalTuple<T>,
 ) -> bool {
+    are_compatible_and_not_disjointed_ignoring(a, b, &[])
+}
+
+fn are_compatible_and_not_disjointed_ignoring<T: Clone + Eq>(
+    a: &InternalTuple<T>,
+    b: &InternalTuple<T>,
+    ignored_positions: &[usize],
+) -> bool {
     let mut found_intersection = false;
-    for (a_value, b_value) in a.iter().zip(b.iter()) {
+    for (i, (a_value, b_value)) in a.iter().zip(b.iter()).enumerate() {
+        if ignored_positions.contains(&i) {
+            continue;
+        }
         if let (Some(a_value), Some(b_value)) = (a_value, b_value) {
             if a_value != b_value {
                 return false;
@@ -2943,6 +4238,230 @@ pub fn are_compatible_and_not_disjointed<T: Clone + Eq>(
         }
     }
     found_intersection
+}
+
+fn minus_shared_graph_only_positions(
+    left: &GraphPattern,
+    right: &GraphPattern,
+    encoded_variables: &mut Vec<Variable>,
+) -> Vec<usize> {
+    let left_graph_only = graph_only_variables(left);
+    if left_graph_only.is_empty() {
+        return Vec::new();
+    }
+    let right_graph_only = graph_only_variables(right);
+    if right_graph_only.is_empty() {
+        return Vec::new();
+    }
+    left_graph_only
+        .into_iter()
+        .filter(|v| right_graph_only.contains(v))
+        .map(|v| encode_variable(encoded_variables, &v))
+        .collect()
+}
+
+fn graph_only_variables(pattern: &GraphPattern) -> FxHashSet<Variable> {
+    let mut graph_variables = FxHashSet::default();
+    lookup_graph_name_variables(pattern, &mut graph_variables);
+    if graph_variables.is_empty() {
+        return graph_variables;
+    }
+    let mut non_graph_variables = FxHashSet::default();
+    lookup_non_graph_variables(pattern, &mut non_graph_variables);
+    graph_variables.retain(|v| !non_graph_variables.contains(v));
+    graph_variables
+}
+
+fn lookup_graph_name_variables(pattern: &GraphPattern, variables: &mut FxHashSet<Variable>) {
+    match pattern {
+        GraphPattern::QuadPattern { graph_name, .. } | GraphPattern::Path { graph_name, .. } => {
+            if let Some(NamedNodePattern::Variable(v)) = graph_name {
+                variables.insert(v.clone());
+            }
+        }
+        GraphPattern::Graph { graph_name } => {
+            if let NamedNodePattern::Variable(v) = graph_name {
+                variables.insert(v.clone());
+            }
+        }
+        GraphPattern::Join { left, right, .. }
+        | GraphPattern::LeftJoin { left, right, .. }
+        | GraphPattern::Minus { left, right, .. } => {
+            lookup_graph_name_variables(left, variables);
+            lookup_graph_name_variables(right, variables);
+        }
+        #[cfg(feature = "sep-0006")]
+        GraphPattern::Lateral { left, right } => {
+            lookup_graph_name_variables(left, variables);
+            lookup_graph_name_variables(right, variables);
+        }
+        GraphPattern::Filter { inner, .. }
+        | GraphPattern::Extend { inner, .. }
+        | GraphPattern::OrderBy { inner, .. }
+        | GraphPattern::Project { inner, .. }
+        | GraphPattern::Distinct { inner, .. }
+        | GraphPattern::Reduced { inner, .. }
+        | GraphPattern::Slice { inner, .. }
+        | GraphPattern::Group { inner, .. }
+        | GraphPattern::Service { inner, .. } => {
+            lookup_graph_name_variables(inner, variables);
+        }
+        GraphPattern::Union { inner } => {
+            for child in inner {
+                lookup_graph_name_variables(child, variables);
+            }
+        }
+        GraphPattern::Values { .. } => {}
+    }
+}
+
+fn lookup_non_graph_variables(pattern: &GraphPattern, variables: &mut FxHashSet<Variable>) {
+    match pattern {
+        GraphPattern::QuadPattern {
+            subject,
+            predicate,
+            object,
+            ..
+        } => {
+            lookup_ground_term_pattern_variables(subject, variables);
+            if let NamedNodePattern::Variable(v) = predicate {
+                variables.insert(v.clone());
+            }
+            lookup_ground_term_pattern_variables(object, variables);
+        }
+        GraphPattern::Path {
+            subject, object, ..
+        } => {
+            lookup_ground_term_pattern_variables(subject, variables);
+            lookup_ground_term_pattern_variables(object, variables);
+        }
+        GraphPattern::Graph { .. } => {}
+        GraphPattern::Join { left, right, .. } | GraphPattern::Minus { left, right, .. } => {
+            lookup_non_graph_variables(left, variables);
+            lookup_non_graph_variables(right, variables);
+        }
+        GraphPattern::LeftJoin {
+            left,
+            right,
+            expression,
+            ..
+        } => {
+            lookup_non_graph_variables(left, variables);
+            lookup_non_graph_variables(right, variables);
+            expression.lookup_used_variables(&mut |v| {
+                variables.insert(v.clone());
+            });
+        }
+        #[cfg(feature = "sep-0006")]
+        GraphPattern::Lateral { left, right } => {
+            lookup_non_graph_variables(left, variables);
+            lookup_non_graph_variables(right, variables);
+        }
+        GraphPattern::Filter { inner, expression } => {
+            lookup_non_graph_variables(inner, variables);
+            expression.lookup_used_variables(&mut |v| {
+                variables.insert(v.clone());
+            });
+        }
+        GraphPattern::Extend {
+            inner,
+            variable,
+            expression,
+        } => {
+            lookup_non_graph_variables(inner, variables);
+            variables.insert(variable.clone());
+            expression.lookup_used_variables(&mut |v| {
+                variables.insert(v.clone());
+            });
+        }
+        GraphPattern::Union { inner } => {
+            for child in inner {
+                lookup_non_graph_variables(child, variables);
+            }
+        }
+        GraphPattern::Values {
+            variables: value_variables,
+            ..
+        } => {
+            variables.extend(value_variables.iter().cloned());
+        }
+        GraphPattern::OrderBy { inner, expression } => {
+            lookup_non_graph_variables(inner, variables);
+            for expression in expression {
+                match expression {
+                    OrderExpression::Asc(expression) | OrderExpression::Desc(expression) => {
+                        expression.lookup_used_variables(&mut |v| {
+                            variables.insert(v.clone());
+                        });
+                    }
+                }
+            }
+        }
+        GraphPattern::Project {
+            inner,
+            variables: projected_variables,
+        } => {
+            lookup_non_graph_variables(inner, variables);
+            variables.extend(projected_variables.iter().cloned());
+        }
+        GraphPattern::Distinct { inner }
+        | GraphPattern::Reduced { inner }
+        | GraphPattern::Slice { inner, .. } => {
+            lookup_non_graph_variables(inner, variables);
+        }
+        GraphPattern::Group {
+            inner,
+            variables: group_variables,
+            aggregates,
+        } => {
+            lookup_non_graph_variables(inner, variables);
+            variables.extend(group_variables.iter().cloned());
+            for (variable, aggregate) in aggregates {
+                variables.insert(variable.clone());
+                lookup_aggregate_expression_variables(aggregate, variables);
+            }
+        }
+        GraphPattern::Service { name, inner, .. } => {
+            if let NamedNodePattern::Variable(v) = name {
+                variables.insert(v.clone());
+            }
+            lookup_non_graph_variables(inner, variables);
+        }
+    }
+}
+
+fn lookup_aggregate_expression_variables(
+    aggregate: &AggregateExpression,
+    variables: &mut FxHashSet<Variable>,
+) {
+    match aggregate {
+        AggregateExpression::CountSolutions { .. } => {}
+        AggregateExpression::FunctionCall { expr, .. } => {
+            expr.lookup_used_variables(&mut |v| {
+                variables.insert(v.clone());
+            });
+        }
+    }
+}
+
+fn lookup_ground_term_pattern_variables(
+    pattern: &GroundTermPattern,
+    variables: &mut FxHashSet<Variable>,
+) {
+    match pattern {
+        GroundTermPattern::NamedNode(_) | GroundTermPattern::Literal(_) => {}
+        GroundTermPattern::Variable(v) => {
+            variables.insert(v.clone());
+        }
+        #[cfg(feature = "sparql-12")]
+        GroundTermPattern::Triple(t) => {
+            lookup_ground_term_pattern_variables(&t.subject, variables);
+            if let NamedNodePattern::Variable(v) = &t.predicate {
+                variables.insert(v.clone());
+            }
+            lookup_ground_term_pattern_variables(&t.object, variables);
+        }
+    }
 }
 
 pub enum PropertyPath<T> {
@@ -2958,9 +4477,481 @@ pub enum PropertyPath<T> {
 
 struct PathEvaluator<'a, D: QueryableDataset<'a>> {
     dataset: EvalDataset<'a, D>,
+    transitive_path_cache: Rc<RefCell<TransitivePathCache<D::InternalTerm>>>,
 }
 
 impl<'a, D: QueryableDataset<'a>> PathEvaluator<'a, D> {
+    fn transitive_path_pattern<'b>(
+        path: &'b PropertyPath<D::InternalTerm>,
+    ) -> Option<TransitivePathPatternRef<'b, D::InternalTerm>> {
+        match path {
+            PropertyPath::ZeroOrMore(path) => {
+                let (predicate, direction) = Self::transitive_path_base(path)?;
+                Some(TransitivePathPatternRef {
+                    predicate,
+                    direction,
+                    kind: TransitivePathKind::ZeroOrMore,
+                })
+            }
+            PropertyPath::OneOrMore(path) => {
+                let (predicate, direction) = Self::transitive_path_base(path)?;
+                Some(TransitivePathPatternRef {
+                    predicate,
+                    direction,
+                    kind: TransitivePathKind::OneOrMore,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn transitive_path_base<'b>(
+        path: &'b PropertyPath<D::InternalTerm>,
+    ) -> Option<(&'b D::InternalTerm, TransitivePathDirection)> {
+        match path {
+            PropertyPath::Path(predicate) => Some((predicate, TransitivePathDirection::Forward)),
+            PropertyPath::Reverse(path) => {
+                let PropertyPath::Path(predicate) = path.as_ref() else {
+                    return None;
+                };
+                Some((predicate, TransitivePathDirection::Reverse))
+            }
+            _ => None,
+        }
+    }
+
+    fn term_can_be_path_subject(
+        &self,
+        term: &D::InternalTerm,
+    ) -> Result<bool, QueryEvaluationError> {
+        Ok(!matches!(
+            self.dataset.externalize_term(term.clone())?,
+            Term::Literal(_)
+        ))
+    }
+
+    fn is_subject_or_object_in_graph(
+        &self,
+        term: &D::InternalTerm,
+        graph_name: Option<&D::InternalTerm>,
+    ) -> Result<bool, QueryEvaluationError> {
+        Ok(self
+            .dataset
+            .internal_quads_for_pattern(Some(term), None, None, Some(graph_name))
+            .next()
+            .transpose()?
+            .is_some()
+            || self
+                .dataset
+                .internal_quads_for_pattern(None, None, Some(term), Some(graph_name))
+                .next()
+                .transpose()?
+                .is_some())
+    }
+
+    fn term_allows_zero_length_path_in_graph(
+        &self,
+        term: &D::InternalTerm,
+        graph_name: Option<&D::InternalTerm>,
+    ) -> Result<bool, QueryEvaluationError> {
+        if self.term_can_be_path_subject(term)? {
+            Ok(true)
+        } else {
+            self.is_subject_or_object_in_graph(term, graph_name)
+        }
+    }
+
+    fn eval_closed_with_transitive_cache(
+        &self,
+        path: &PropertyPath<D::InternalTerm>,
+        start: &D::InternalTerm,
+        end: &D::InternalTerm,
+        graph_name: Option<&D::InternalTerm>,
+    ) -> Result<Option<bool>, QueryEvaluationError> {
+        let Some(pattern) = Self::transitive_path_pattern(path) else {
+            return Ok(None);
+        };
+        if pattern.kind == TransitivePathKind::ZeroOrMore && start == end {
+            let stats = Rc::clone(&self.transitive_path_cache.borrow().stats);
+            stats
+                .transitive_reachability_tests
+                .set(stats.transitive_reachability_tests.get().saturating_add(1));
+            return Ok(Some(
+                self.term_allows_zero_length_path_in_graph(start, graph_name)?,
+            ));
+        }
+        let Some(result) = self.transitive_plus_reachable(
+            pattern.predicate,
+            graph_name,
+            pattern.direction,
+            start,
+            end,
+        )?
+        else {
+            return Ok(None);
+        };
+        let stats = Rc::clone(&self.transitive_path_cache.borrow().stats);
+        stats
+            .transitive_reachability_tests
+            .set(stats.transitive_reachability_tests.get().saturating_add(1));
+        Ok(Some(result))
+    }
+
+    fn eval_from_with_transitive_cache(
+        &self,
+        path: &PropertyPath<D::InternalTerm>,
+        start: &D::InternalTerm,
+        graph_name: Option<&D::InternalTerm>,
+    ) -> Result<Option<Vec<D::InternalTerm>>, QueryEvaluationError> {
+        let Some(pattern) = Self::transitive_path_pattern(path) else {
+            return Ok(None);
+        };
+        let stats = Rc::clone(&self.transitive_path_cache.borrow().stats);
+        stats
+            .transitive_enumerations
+            .set(stats.transitive_enumerations.get().saturating_add(1));
+        let Some(closure) =
+            self.transitive_plus_closure(pattern.predicate, graph_name, pattern.direction, start)?
+        else {
+            return Ok(None);
+        };
+        let mut results = Vec::with_capacity(
+            closure.len() + usize::from(pattern.kind == TransitivePathKind::ZeroOrMore),
+        );
+        if pattern.kind == TransitivePathKind::ZeroOrMore {
+            if !self.term_allows_zero_length_path_in_graph(start, graph_name)? {
+                return Ok(Some(Vec::new()));
+            }
+            results.push(start.clone());
+            for term in closure.iter() {
+                if term != start {
+                    results.push(term.clone());
+                }
+            }
+        } else {
+            results.extend(closure.iter().cloned());
+        }
+        Ok(Some(results))
+    }
+
+    fn eval_to_with_transitive_cache(
+        &self,
+        path: &PropertyPath<D::InternalTerm>,
+        end: &D::InternalTerm,
+        graph_name: Option<&D::InternalTerm>,
+    ) -> Result<Option<Vec<D::InternalTerm>>, QueryEvaluationError> {
+        let Some(pattern) = Self::transitive_path_pattern(path) else {
+            return Ok(None);
+        };
+        let stats = Rc::clone(&self.transitive_path_cache.borrow().stats);
+        stats
+            .transitive_enumerations
+            .set(stats.transitive_enumerations.get().saturating_add(1));
+        let Some(closure) = self.transitive_plus_closure(
+            pattern.predicate,
+            graph_name,
+            pattern.direction.opposite(),
+            end,
+        )?
+        else {
+            return Ok(None);
+        };
+        let mut results = Vec::with_capacity(
+            closure.len() + usize::from(pattern.kind == TransitivePathKind::ZeroOrMore),
+        );
+        if pattern.kind == TransitivePathKind::ZeroOrMore {
+            if !self.term_allows_zero_length_path_in_graph(end, graph_name)? {
+                return Ok(Some(Vec::new()));
+            }
+            results.push(end.clone());
+            for term in closure.iter() {
+                if term != end {
+                    results.push(term.clone());
+                }
+            }
+        } else {
+            results.extend(closure.iter().cloned());
+        }
+        Ok(Some(results))
+    }
+
+    fn eval_open_with_transitive_cache(
+        &self,
+        path: &PropertyPath<D::InternalTerm>,
+        graph_name: Option<&D::InternalTerm>,
+    ) -> Result<Option<Vec<(D::InternalTerm, D::InternalTerm)>>, QueryEvaluationError> {
+        let Some(pattern) = Self::transitive_path_pattern(path) else {
+            return Ok(None);
+        };
+        let stats = Rc::clone(&self.transitive_path_cache.borrow().stats);
+        stats
+            .transitive_enumerations
+            .set(stats.transitive_enumerations.get().saturating_add(1));
+        let Some(plus_pairs) =
+            self.transitive_plus_pairs(pattern.predicate, graph_name, pattern.direction)?
+        else {
+            return Ok(None);
+        };
+        if pattern.kind == TransitivePathKind::OneOrMore {
+            return Ok(Some(plus_pairs.iter().cloned().collect()));
+        }
+        let Some(nodes) = self.graph_nodes_in_graph(graph_name)? else {
+            return Ok(None);
+        };
+        let mut results = Vec::with_capacity(nodes.len().saturating_add(plus_pairs.len()));
+        results.extend(nodes.iter().cloned().map(|term| (term.clone(), term)));
+        for (start, end) in plus_pairs.iter() {
+            if start != end {
+                results.push((start.clone(), end.clone()));
+            }
+        }
+        Ok(Some(results))
+    }
+
+    fn transitive_plus_closure(
+        &self,
+        predicate: &D::InternalTerm,
+        graph_name: Option<&D::InternalTerm>,
+        direction: TransitivePathDirection,
+        start: &D::InternalTerm,
+    ) -> Result<Option<Arc<[D::InternalTerm]>>, QueryEvaluationError> {
+        let key = TransitivePathIndexKey {
+            graph_name: graph_name.cloned(),
+            predicate: predicate.clone(),
+        };
+        let (max_edges, max_closures_per_index) = {
+            let cache = self.transitive_path_cache.borrow();
+            if !cache.enabled {
+                return Ok(None);
+            }
+            (cache.max_edges, cache.max_closures_per_index)
+        };
+        {
+            let mut cache = self.transitive_path_cache.borrow_mut();
+            let stats = Rc::clone(&cache.stats);
+            if let Some(index) = cache.indexes.get_mut(&key) {
+                return Ok(index.plus_closure(start, direction, &stats, max_closures_per_index));
+            }
+        }
+
+        let built_index = self.build_transitive_index(predicate, graph_name, max_edges)?;
+        let mut cache = self.transitive_path_cache.borrow_mut();
+        if !cache.enabled {
+            return Ok(None);
+        }
+        let stats = Rc::clone(&cache.stats);
+        let index = match cache.indexes.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                stats
+                    .transitive_index_builds
+                    .set(stats.transitive_index_builds.get().saturating_add(1));
+                entry.insert(built_index)
+            }
+        };
+        Ok(index.plus_closure(start, direction, &stats, max_closures_per_index))
+    }
+
+    fn transitive_plus_pairs(
+        &self,
+        predicate: &D::InternalTerm,
+        graph_name: Option<&D::InternalTerm>,
+        direction: TransitivePathDirection,
+    ) -> Result<Option<Arc<[(D::InternalTerm, D::InternalTerm)]>>, QueryEvaluationError> {
+        let key = TransitivePathIndexKey {
+            graph_name: graph_name.cloned(),
+            predicate: predicate.clone(),
+        };
+        let (max_edges, max_closures_per_index, max_pairs_per_index) = {
+            let cache = self.transitive_path_cache.borrow();
+            if !cache.enabled {
+                return Ok(None);
+            }
+            (
+                cache.max_edges,
+                cache.max_closures_per_index,
+                cache.max_pairs_per_index,
+            )
+        };
+        {
+            let mut cache = self.transitive_path_cache.borrow_mut();
+            let stats = Rc::clone(&cache.stats);
+            if let Some(index) = cache.indexes.get_mut(&key) {
+                return Ok(index.plus_pairs(
+                    direction,
+                    &stats,
+                    max_closures_per_index,
+                    max_pairs_per_index,
+                ));
+            }
+        }
+
+        let built_index = self.build_transitive_index(predicate, graph_name, max_edges)?;
+        let mut cache = self.transitive_path_cache.borrow_mut();
+        if !cache.enabled {
+            return Ok(None);
+        }
+        let stats = Rc::clone(&cache.stats);
+        let index = match cache.indexes.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                stats
+                    .transitive_index_builds
+                    .set(stats.transitive_index_builds.get().saturating_add(1));
+                entry.insert(built_index)
+            }
+        };
+        Ok(index.plus_pairs(
+            direction,
+            &stats,
+            max_closures_per_index,
+            max_pairs_per_index,
+        ))
+    }
+
+    fn transitive_plus_reachable(
+        &self,
+        predicate: &D::InternalTerm,
+        graph_name: Option<&D::InternalTerm>,
+        direction: TransitivePathDirection,
+        start: &D::InternalTerm,
+        end: &D::InternalTerm,
+    ) -> Result<Option<bool>, QueryEvaluationError> {
+        let key = TransitivePathIndexKey {
+            graph_name: graph_name.cloned(),
+            predicate: predicate.clone(),
+        };
+        let (max_edges, max_closures_per_index, max_reachability_per_index) = {
+            let cache = self.transitive_path_cache.borrow();
+            if !cache.enabled {
+                return Ok(None);
+            }
+            (
+                cache.max_edges,
+                cache.max_closures_per_index,
+                cache.max_reachability_per_index,
+            )
+        };
+        {
+            let mut cache = self.transitive_path_cache.borrow_mut();
+            let stats = Rc::clone(&cache.stats);
+            if let Some(index) = cache.indexes.get_mut(&key) {
+                return Ok(index.plus_reachable(
+                    start,
+                    end,
+                    direction,
+                    &stats,
+                    max_closures_per_index,
+                    max_reachability_per_index,
+                ));
+            }
+        }
+        let built_index = self.build_transitive_index(predicate, graph_name, max_edges)?;
+        let mut cache = self.transitive_path_cache.borrow_mut();
+        if !cache.enabled {
+            return Ok(None);
+        }
+        let stats = Rc::clone(&cache.stats);
+        let index = match cache.indexes.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                stats
+                    .transitive_index_builds
+                    .set(stats.transitive_index_builds.get().saturating_add(1));
+                entry.insert(built_index)
+            }
+        };
+        Ok(index.plus_reachable(
+            start,
+            end,
+            direction,
+            &stats,
+            max_closures_per_index,
+            max_reachability_per_index,
+        ))
+    }
+
+    fn graph_nodes_in_graph(
+        &self,
+        graph_name: Option<&D::InternalTerm>,
+    ) -> Result<Option<Arc<[D::InternalTerm]>>, QueryEvaluationError> {
+        let key = graph_name.cloned();
+        let max_graph_nodes = {
+            let cache = self.transitive_path_cache.borrow();
+            if cache.graph_nodes_disabled.contains(&key) {
+                return Ok(None);
+            }
+            if let Some(nodes) = cache.graph_nodes.get(&key) {
+                return Ok(Some(Arc::clone(nodes)));
+            }
+            cache.max_graph_nodes_per_graph
+        };
+        {
+            let cache = self.transitive_path_cache.borrow();
+            if cache.graph_nodes_disabled.contains(&key) {
+                return Ok(None);
+            }
+        }
+        let mut nodes = FxHashSet::default();
+        for quad in self
+            .dataset
+            .internal_quads_for_pattern(None, None, None, Some(graph_name))
+        {
+            let quad = quad?;
+            nodes.insert(quad.subject);
+            if max_graph_nodes > 0 && nodes.len() > max_graph_nodes {
+                let mut cache = self.transitive_path_cache.borrow_mut();
+                cache.graph_nodes_disabled.insert(key);
+                return Ok(None);
+            }
+            nodes.insert(quad.object);
+            if max_graph_nodes > 0 && nodes.len() > max_graph_nodes {
+                let mut cache = self.transitive_path_cache.borrow_mut();
+                cache.graph_nodes_disabled.insert(key);
+                return Ok(None);
+            }
+        }
+        let nodes: Arc<[D::InternalTerm]> = nodes.into_iter().collect::<Vec<_>>().into();
+        let mut cache = self.transitive_path_cache.borrow_mut();
+        Ok(Some(Arc::clone(
+            cache
+                .graph_nodes
+                .entry(key)
+                .or_insert_with(|| Arc::clone(&nodes)),
+        )))
+    }
+
+    fn build_transitive_index(
+        &self,
+        predicate: &D::InternalTerm,
+        graph_name: Option<&D::InternalTerm>,
+        max_edges: usize,
+    ) -> Result<TransitivePredicateIndex<D::InternalTerm>, QueryEvaluationError> {
+        let mut index = TransitivePredicateIndex::default();
+        let mut edge_count = 0_usize;
+        for quad in
+            self.dataset
+                .internal_quads_for_pattern(None, Some(predicate), None, Some(graph_name))
+        {
+            let quad = quad?;
+            edge_count = edge_count.saturating_add(1);
+            if edge_count > max_edges {
+                return Ok(TransitivePredicateIndex::disabled());
+            }
+            index
+                .forward_adj
+                .entry(quad.subject.clone())
+                .or_default()
+                .push(quad.object.clone());
+            index
+                .reverse_adj
+                .entry(quad.object)
+                .or_default()
+                .push(quad.subject);
+        }
+        Ok(index)
+    }
+
     fn eval_closed_in_graph(
         &self,
         path: &PropertyPath<D::InternalTerm>,
@@ -2968,6 +4959,11 @@ impl<'a, D: QueryableDataset<'a>> PathEvaluator<'a, D> {
         end: &D::InternalTerm,
         graph_name: Option<&D::InternalTerm>,
     ) -> Result<bool, QueryEvaluationError> {
+        if let Some(result) =
+            self.eval_closed_with_transitive_cache(path, start, end, graph_name)?
+        {
+            return Ok(result);
+        }
         Ok(match path {
             PropertyPath::Path(p) => self
                 .dataset
@@ -2995,7 +4991,7 @@ impl<'a, D: QueryableDataset<'a>> PathEvaluator<'a, D> {
             }
             PropertyPath::ZeroOrMore(p) => {
                 if start == end {
-                    self.is_subject_or_object_in_graph(start, graph_name)?
+                    self.term_allows_zero_length_path_in_graph(start, graph_name)?
                 } else {
                     look_in_transitive_closure(
                         self.eval_from_in_graph(p, start, graph_name),
@@ -3011,7 +5007,7 @@ impl<'a, D: QueryableDataset<'a>> PathEvaluator<'a, D> {
             )?,
             PropertyPath::ZeroOrOne(p) => {
                 if start == end {
-                    self.is_subject_or_object_in_graph(start, graph_name)
+                    self.term_allows_zero_length_path_in_graph(start, graph_name)
                 } else {
                     self.eval_closed_in_graph(p, start, end, graph_name)
                 }?
@@ -3138,6 +5134,11 @@ impl<'a, D: QueryableDataset<'a>> PathEvaluator<'a, D> {
         start: &D::InternalTerm,
         graph_name: Option<&D::InternalTerm>,
     ) -> Box<dyn Iterator<Item = Result<D::InternalTerm, QueryEvaluationError>> + 'a> {
+        match self.eval_from_with_transitive_cache(path, start, graph_name) {
+            Ok(Some(results)) => return Box::new(results.into_iter().map(Ok)),
+            Ok(None) => {}
+            Err(error) => return Box::new(once(Err(error))),
+        }
         match path {
             PropertyPath::Path(p) => Box::new(
                 self.dataset
@@ -3161,14 +5162,17 @@ impl<'a, D: QueryableDataset<'a>> PathEvaluator<'a, D> {
                     .chain(self.eval_from_in_graph(b, start, graph_name)),
             )),
             PropertyPath::ZeroOrMore(p) => {
-                self.run_if_term_is_a_graph_node(start, graph_name, || {
-                    let eval = self.clone();
-                    let p = Rc::clone(p);
-                    let graph_name2 = graph_name.cloned();
-                    transitive_closure(Some(Ok(start.clone())), move |e| {
-                        eval.eval_from_in_graph(&p, &e, graph_name2.as_ref())
-                    })
-                })
+                match self.term_allows_zero_length_path_in_graph(start, graph_name) {
+                    Ok(true) => {}
+                    Ok(false) => return Box::new(empty()),
+                    Err(error) => return Box::new(once(Err(error))),
+                }
+                let eval = self.clone();
+                let p = Rc::clone(p);
+                let graph_name2 = graph_name.cloned();
+                Box::new(transitive_closure(Some(Ok(start.clone())), move |e| {
+                    eval.eval_from_in_graph(&p, &e, graph_name2.as_ref())
+                }))
             }
             PropertyPath::OneOrMore(p) => {
                 let eval = self.clone();
@@ -3180,12 +5184,14 @@ impl<'a, D: QueryableDataset<'a>> PathEvaluator<'a, D> {
                 ))
             }
             PropertyPath::ZeroOrOne(p) => {
-                self.run_if_term_is_a_graph_node(start, graph_name, || {
-                    hash_deduplicate(
-                        once(Ok(start.clone()))
-                            .chain(self.eval_from_in_graph(p, start, graph_name)),
-                    )
-                })
+                match self.term_allows_zero_length_path_in_graph(start, graph_name) {
+                    Ok(true) => {}
+                    Ok(false) => return Box::new(empty()),
+                    Err(error) => return Box::new(once(Err(error))),
+                }
+                Box::new(hash_deduplicate(
+                    once(Ok(start.clone())).chain(self.eval_from_in_graph(p, start, graph_name)),
+                ))
             }
             PropertyPath::NegatedPropertySet(ps) => {
                 let ps = Rc::clone(ps);
@@ -3304,6 +5310,11 @@ impl<'a, D: QueryableDataset<'a>> PathEvaluator<'a, D> {
         end: &D::InternalTerm,
         graph_name: Option<&D::InternalTerm>,
     ) -> Box<dyn Iterator<Item = Result<D::InternalTerm, QueryEvaluationError>> + 'a> {
+        match self.eval_to_with_transitive_cache(path, end, graph_name) {
+            Ok(Some(results)) => return Box::new(results.into_iter().map(Ok)),
+            Ok(None) => {}
+            Err(error) => return Box::new(once(Err(error))),
+        }
         match path {
             PropertyPath::Path(p) => Box::new(
                 self.dataset
@@ -3327,14 +5338,17 @@ impl<'a, D: QueryableDataset<'a>> PathEvaluator<'a, D> {
                     .chain(self.eval_to_in_graph(b, end, graph_name)),
             )),
             PropertyPath::ZeroOrMore(p) => {
-                self.run_if_term_is_a_graph_node(end, graph_name, || {
-                    let eval = self.clone();
-                    let p = Rc::clone(p);
-                    let graph_name2 = graph_name.cloned();
-                    transitive_closure(Some(Ok(end.clone())), move |e| {
-                        eval.eval_to_in_graph(&p, &e, graph_name2.as_ref())
-                    })
-                })
+                match self.term_allows_zero_length_path_in_graph(end, graph_name) {
+                    Ok(true) => {}
+                    Ok(false) => return Box::new(empty()),
+                    Err(error) => return Box::new(once(Err(error))),
+                }
+                let eval = self.clone();
+                let p = Rc::clone(p);
+                let graph_name2 = graph_name.cloned();
+                Box::new(transitive_closure(Some(Ok(end.clone())), move |e| {
+                    eval.eval_to_in_graph(&p, &e, graph_name2.as_ref())
+                }))
             }
             PropertyPath::OneOrMore(p) => {
                 let eval = self.clone();
@@ -3345,11 +5359,16 @@ impl<'a, D: QueryableDataset<'a>> PathEvaluator<'a, D> {
                     move |e| eval.eval_to_in_graph(&p, &e, graph_name2.as_ref()),
                 ))
             }
-            PropertyPath::ZeroOrOne(p) => self.run_if_term_is_a_graph_node(end, graph_name, || {
-                hash_deduplicate(
+            PropertyPath::ZeroOrOne(p) => {
+                match self.term_allows_zero_length_path_in_graph(end, graph_name) {
+                    Ok(true) => {}
+                    Ok(false) => return Box::new(empty()),
+                    Err(error) => return Box::new(once(Err(error))),
+                }
+                Box::new(hash_deduplicate(
                     once(Ok(end.clone())).chain(self.eval_to_in_graph(p, end, graph_name)),
-                )
-            }),
+                ))
+            }
             PropertyPath::NegatedPropertySet(ps) => {
                 let ps = Rc::clone(ps);
                 Box::new(
@@ -3468,6 +5487,11 @@ impl<'a, D: QueryableDataset<'a>> PathEvaluator<'a, D> {
     ) -> Box<
         dyn Iterator<Item = Result<(D::InternalTerm, D::InternalTerm), QueryEvaluationError>> + 'a,
     > {
+        match self.eval_open_with_transitive_cache(path, graph_name) {
+            Ok(Some(results)) => return Box::new(results.into_iter().map(Ok)),
+            Ok(None) => {}
+            Err(error) => return Box::new(once(Err(error))),
+        }
         match path {
             PropertyPath::Path(p) => Box::new(
                 self.dataset
@@ -3661,43 +5685,6 @@ impl<'a, D: QueryableDataset<'a>> PathEvaluator<'a, D> {
             })
     }
 
-    fn run_if_term_is_a_graph_node<
-        T: 'a,
-        I: Iterator<Item = Result<T, QueryEvaluationError>> + 'a,
-    >(
-        &self,
-        term: &D::InternalTerm,
-        graph_name: Option<&D::InternalTerm>,
-        f: impl FnOnce() -> I,
-    ) -> Box<dyn Iterator<Item = Result<T, QueryEvaluationError>> + 'a> {
-        match self.is_subject_or_object_in_graph(term, graph_name) {
-            Ok(true) => Box::new(f()),
-            Ok(false) => {
-                Box::new(empty()) // Not in the database
-            }
-            Err(error) => Box::new(once(Err(error))),
-        }
-    }
-
-    fn is_subject_or_object_in_graph(
-        &self,
-        term: &D::InternalTerm,
-        graph_name: Option<&D::InternalTerm>,
-    ) -> Result<bool, QueryEvaluationError> {
-        Ok(self
-            .dataset
-            .internal_quads_for_pattern(Some(term), None, None, Some(graph_name))
-            .next()
-            .transpose()?
-            .is_some()
-            || self
-                .dataset
-                .internal_quads_for_pattern(None, None, Some(term), Some(graph_name))
-                .next()
-                .transpose()?
-                .is_some())
-    }
-
     fn run_if_term_is_a_dataset_node<
         T: 'a,
         I: IntoIterator<Item = Result<T, QueryEvaluationError>> + 'a,
@@ -3734,6 +5721,7 @@ impl<'a, D: QueryableDataset<'a>> Clone for PathEvaluator<'a, D> {
     fn clone(&self) -> Self {
         Self {
             dataset: self.dataset.clone(),
+            transitive_path_cache: Rc::clone(&self.transitive_path_cache),
         }
     }
 }

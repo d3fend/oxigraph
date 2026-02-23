@@ -288,6 +288,7 @@ pub fn main() -> anyhow::Result<()> {
             explain,
             explain_file,
             stats,
+            without_optimizations,
             union_default_graph,
         } => {
             let query = if let Some(query) = query {
@@ -303,6 +304,9 @@ pub fn main() -> anyhow::Result<()> {
             let mut evaluator = default_sparql_evaluator();
             if let Some(base) = query_base {
                 evaluator = evaluator.with_base_iri(&base)?;
+            }
+            if without_optimizations {
+                evaluator = evaluator.without_optimizations();
             }
             let mut prepared = evaluator.parse_query(&query)?;
             if union_default_graph {

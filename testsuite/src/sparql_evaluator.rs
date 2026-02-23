@@ -4,6 +4,7 @@ use crate::manifest::*;
 use crate::report::{dataset_diff, format_diff};
 use crate::vocab::*;
 use anyhow::{Context, Result, bail, ensure};
+use csv::ReaderBuilder;
 use oxigraph::io::RdfParser;
 use oxigraph::model::dataset::CanonicalizationAlgorithm;
 use oxigraph::model::vocab::rdf;
@@ -13,16 +14,20 @@ use oxigraph::model::{
 };
 use oxigraph::sparql::QueryResults;
 use oxigraph::sparql::results::{
-    QueryResultsFormat, QueryResultsParser, ReaderQueryResultsParserOutput,
+    QueryResultsFormat, QueryResultsParser, QueryResultsSerializer, ReaderQueryResultsParserOutput,
 };
 use oxigraph::store::Store;
 use oxiri::Iri;
-use spareval::{DefaultServiceHandler, QueryEvaluationError, QueryEvaluator, QuerySolutionIter};
+use spareval::{
+    DefaultServiceHandler, ExpressionTerm, InternalQuad, QueryEvaluationError, QueryEvaluator,
+    QuerySolutionIter, QueryableDataset,
+};
 use spargebra::algebra::GraphPattern;
 use spargebra::{Query, SparqlParser};
 use spargeo::GEOSPARQL_EXTENSION_FUNCTIONS;
 use sparopt::Optimizer;
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::fmt::Write;
 use std::io;
 use std::str::FromStr;
@@ -48,6 +53,10 @@ pub fn register_sparql_tests(evaluator: &mut TestEvaluator) {
     evaluator.register(
         "http://www.w3.org/2001/sw/DataAccess/tests/test-manifest#QueryEvaluationTest",
         evaluate_evaluation_test,
+    );
+    evaluator.register(
+        "http://www.w3.org/2001/sw/DataAccess/tests/test-manifest#CSVResultFormatTest",
+        evaluate_csv_result_format_test,
     );
     evaluator.register(
         "http://www.w3.org/2001/sw/DataAccess/tests/test-manifest#PositiveUpdateSyntaxTest",
@@ -160,13 +169,128 @@ fn evaluate_negative_result_syntax_test(test: &Test, format: QueryResultsFormat)
     Ok(())
 }
 
+#[derive(Default)]
+struct DatasetWithNamedGraphs {
+    dataset: Dataset,
+    named_graphs: Vec<Term>,
+}
+
+impl DatasetWithNamedGraphs {
+    fn insert_named_graph(&mut self, graph_name: NamedNode) {
+        let graph_name: Term = graph_name.into();
+        if !self.named_graphs.contains(&graph_name) {
+            self.named_graphs.push(graph_name);
+        }
+    }
+}
+
+impl<'a> QueryableDataset<'a> for &'a DatasetWithNamedGraphs {
+    type InternalTerm = Term;
+    type Error = Infallible;
+
+    fn internal_quads_for_pattern(
+        &self,
+        subject: Option<&Term>,
+        predicate: Option<&Term>,
+        object: Option<&Term>,
+        graph_name: Option<Option<&Term>>,
+    ) -> impl Iterator<Item = Result<InternalQuad<Term>, Infallible>> + use<'a> {
+        let subject = subject.cloned();
+        let predicate = predicate.cloned();
+        let object = object.cloned();
+        let graph_name = graph_name.map(|graph_name| graph_name.cloned());
+        Box::new(self.dataset.iter().filter_map(move |quad| {
+            let quad_graph_name = match quad.graph_name {
+                GraphNameRef::NamedNode(graph_name) => Some(Term::from(graph_name)),
+                GraphNameRef::BlankNode(graph_name) => Some(Term::from(graph_name)),
+                GraphNameRef::DefaultGraph => None,
+            };
+            let requested_graph_name_match = match &graph_name {
+                None => quad_graph_name.is_some(),
+                Some(None) => quad_graph_name.is_none(),
+                Some(Some(graph_name)) => quad_graph_name.as_ref() == Some(graph_name),
+            };
+            if !requested_graph_name_match {
+                return None;
+            }
+            if subject.as_ref().is_some_and(|subject| {
+                let term = Term::from(quad.subject);
+                &term != subject
+            }) {
+                return None;
+            }
+            if predicate.as_ref().is_some_and(|predicate| {
+                let term = Term::from(quad.predicate);
+                &term != predicate
+            }) {
+                return None;
+            }
+            if object.as_ref().is_some_and(|object| {
+                let term = Term::from(quad.object);
+                &term != object
+            }) {
+                return None;
+            }
+            Some(Ok(InternalQuad {
+                subject: quad.subject.into(),
+                predicate: quad.predicate.into(),
+                object: quad.object.into(),
+                graph_name: quad_graph_name,
+            }))
+        }))
+    }
+
+    fn internal_named_graphs(&self) -> impl Iterator<Item = Result<Term, Infallible>> + use<'a> {
+        let mut graph_names = self.named_graphs.clone();
+        let dataset_graph_names = self
+            .dataset
+            .iter()
+            .filter_map(|q| match q.graph_name {
+                GraphNameRef::NamedNode(graph_name) => Some(Term::from(graph_name)),
+                GraphNameRef::BlankNode(graph_name) => Some(Term::from(graph_name)),
+                GraphNameRef::DefaultGraph => None,
+            })
+            .collect::<Vec<_>>();
+        for graph_name in dataset_graph_names {
+            if !graph_names.contains(&graph_name) {
+                graph_names.push(graph_name);
+            }
+        }
+        Box::new(graph_names.into_iter().map(Ok))
+    }
+
+    fn contains_internal_graph_name(&self, graph_name: &Term) -> Result<bool, Infallible> {
+        if self.named_graphs.contains(graph_name) {
+            return Ok(true);
+        }
+        Ok(self.dataset.iter().any(|q| match q.graph_name {
+            GraphNameRef::NamedNode(graph) => Term::from(graph) == *graph_name,
+            GraphNameRef::BlankNode(graph) => Term::from(graph) == *graph_name,
+            GraphNameRef::DefaultGraph => false,
+        }))
+    }
+
+    fn internalize_term(&self, term: Term) -> Result<Term, Infallible> {
+        Ok(term)
+    }
+
+    fn externalize_term(&self, term: Term) -> Result<Term, Infallible> {
+        Ok(term)
+    }
+
+    fn externalize_expression_term(&self, term: Term) -> Result<ExpressionTerm, Infallible> {
+        Ok(term.into())
+    }
+}
+
 fn evaluate_evaluation_test(test: &Test) -> Result<()> {
-    let mut dataset = Dataset::new();
+    let mut dataset = DatasetWithNamedGraphs::default();
     if let Some(data) = &test.data {
-        load_to_dataset(data, &mut dataset, GraphName::DefaultGraph)?;
+        load_to_dataset(data, &mut dataset.dataset, GraphName::DefaultGraph)?;
     }
     for (name, value) in &test.graph_data {
-        load_to_dataset(value, &mut dataset, name.clone())?;
+        dataset.insert_named_graph(name.clone());
+        load_to_dataset(value, &mut dataset.dataset, name.clone())?;
     }
     let query_file = test.query.as_deref().context("No action found")?;
     let query = SparqlParser::new()
@@ -185,14 +309,23 @@ fn evaluate_evaluation_test(test: &Test) -> Result<()> {
         evaluator = evaluator.with_custom_function(name.into(), implementation)
     }
 
-    // FROM and FROM NAMED support. We make sure the data is in the store
+    // FROM and FROM NAMED support. We make sure the data is in the dataset.
     if let Some(query_dataset) = query.dataset() {
         for graph_name in &query_dataset.default {
-            load_to_dataset(graph_name.as_str(), &mut dataset, graph_name.clone())?;
+            load_to_dataset(
+                graph_name.as_str(),
+                &mut dataset.dataset,
+                graph_name.clone(),
+            )?;
         }
         if let Some(named_graphs) = &query_dataset.named {
             for graph_name in named_graphs {
-                load_to_dataset(graph_name.as_str(), &mut dataset, graph_name.clone())?;
+                dataset.insert_named_graph(graph_name.clone());
+                load_to_dataset(
+                    graph_name.as_str(),
+                    &mut dataset.dataset,
+                    graph_name.clone(),
+                )?;
             }
         }
     }
@@ -216,11 +349,131 @@ fn evaluate_evaluation_test(test: &Test) -> Result<()> {
 
         ensure!(
             are_query_results_isomorphic(&expected_results, &actual_results),
-            "Not isomorphic results.\n{}\nParsed query:\n{query}\nData:\n{dataset}\n",
+            "Not isomorphic results.\n{}\nParsed query:\n{query}\n",
             results_diff(expected_results, actual_results),
         );
     }
     Ok(())
+}
+
+fn evaluate_csv_result_format_test(test: &Test) -> Result<()> {
+    let mut dataset = DatasetWithNamedGraphs::default();
+    if let Some(data) = &test.data {
+        load_to_dataset(data, &mut dataset.dataset, GraphName::DefaultGraph)?;
+    }
+    for (name, value) in &test.graph_data {
+        dataset.insert_named_graph(name.clone());
+        load_to_dataset(value, &mut dataset.dataset, name.clone())?;
+    }
+    let query_file = test.query.as_deref().context("No action found")?;
+    let query = SparqlParser::new()
+        .with_base_iri(query_file)?
+        .parse_query(&read_file_to_string(query_file)?)
+        .context("Failure to parse query")?;
+
+    let expected_csv = read_file_to_string(test.result.as_deref().context("No result found")?)?;
+
+    let mut evaluator = QueryEvaluator::new()
+        .with_default_service_handler(StaticServiceHandler::new(&test.service_data)?);
+    for (name, implementation) in GEOSPARQL_EXTENSION_FUNCTIONS {
+        evaluator = evaluator.with_custom_function(name.into(), implementation)
+    }
+
+    for with_query_optimizer in [true, false] {
+        let mut evaluator = evaluator.clone();
+        if !with_query_optimizer {
+            evaluator = evaluator.without_optimizations();
+        }
+        let QueryResults::Solutions(solutions) = evaluator.prepare(&query).execute(&dataset)?
+        else {
+            bail!("CSVResultFormatTest expects solution results");
+        };
+        let mut actual_csv = Vec::new();
+        let mut serializer = QueryResultsSerializer::from_format(QueryResultsFormat::Csv)
+            .serialize_solutions_to_writer(&mut actual_csv, solutions.variables().to_vec())?;
+        for solution in solutions {
+            serializer.serialize(&solution?)?;
+        }
+        serializer.finish()?;
+        let actual_csv = String::from_utf8(actual_csv)?;
+        let expected_table = parse_csv_table(&expected_csv)?;
+        let actual_table = parse_csv_table(&actual_csv)?;
+        ensure!(
+            csv_tables_match(&expected_table, &actual_table),
+            "CSV output mismatch.\nExpected:\n{expected_csv}\nActual:\n{actual_csv}"
+        );
+    }
+    Ok(())
+}
+
+struct CsvTable {
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+}
+
+fn parse_csv_table(input: &str) -> Result<CsvTable> {
+    let mut reader = ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(input.as_bytes());
+    let headers = reader
+        .headers()?
+        .iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let rows = reader
+        .records()
+        .map(|record| record.map(|record| record.iter().map(str::to_owned).collect::<Vec<_>>()))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(CsvTable { headers, rows })
+}
+
+fn csv_tables_match(expected: &CsvTable, actual: &CsvTable) -> bool {
+    if expected.headers.len() != actual.headers.len() {
+        return false;
+    }
+    let actual_positions = actual
+        .headers
+        .iter()
+        .enumerate()
+        .map(|(i, header)| (header, i))
+        .collect::<HashMap<_, _>>();
+    if expected
+        .headers
+        .iter()
+        .any(|header| !actual_positions.contains_key(header))
+    {
+        return false;
+    }
+    if expected.rows.len() != actual.rows.len() {
+        return false;
+    }
+    expected
+        .rows
+        .iter()
+        .zip(&actual.rows)
+        .all(|(expected_row, actual_row)| {
+            expected
+                .headers
+                .iter()
+                .enumerate()
+                .all(|(expected_index, header)| {
+                    let actual_index = *actual_positions.get(header).expect("header checked above");
+                    csv_cells_match(&expected_row[expected_index], &actual_row[actual_index])
+                })
+        })
+}
+
+fn csv_cells_match(expected: &str, actual: &str) -> bool {
+    if expected == actual {
+        return true;
+    }
+    if expected.starts_with("_:") && actual.starts_with("_:") {
+        return true;
+    }
+    match (expected.parse::<f64>(), actual.parse::<f64>()) {
+        (Ok(expected), Ok(actual)) => expected == actual,
+        _ => false,
+    }
 }
 
 fn evaluate_positive_update_syntax_test(test: &Test) -> Result<()> {

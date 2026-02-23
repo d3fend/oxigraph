@@ -15,6 +15,7 @@ rdf-12 = ["oxigraph/rdf-12"]
 [dependencies]
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
+csv.workspace = true
 dissimilar.workspace = true
 json-event-parser.workspace = true
 oxigraph.workspace = true

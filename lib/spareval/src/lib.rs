@@ -17,7 +17,7 @@ pub use crate::dataset::ExpressionTriple;
 pub use crate::dataset::{ExpressionTerm, InternalQuad, QueryableDataset};
 pub use crate::error::QueryEvaluationError;
 pub use crate::eval::CancellationToken;
-use crate::eval::{EvalNodeWithStats, SimpleEvaluator, Timer};
+use crate::eval::{EvalNodeWithStats, SimpleEvaluator, Timer, TransitivePathStatsSnapshot};
 use crate::expression::{
     CustomFunctionRegistry, ExpressionEvaluatorContext, build_expression_evaluator,
 };
@@ -672,7 +672,9 @@ impl PreparedQuery<'_> {
         QueryExplanation,
     ) {
         let start_planning = Timer::now();
-        let (results, plan_node_with_stats, planning_duration) = match self.query {
+        let (results, plan_node_with_stats, planning_duration, transitive_path_stats) = match self
+            .query
+        {
             Query::Select {
                 pattern, base_iri, ..
             } => {
@@ -681,18 +683,30 @@ impl PreparedQuery<'_> {
                     pattern = Optimizer::optimize_graph_pattern(pattern);
                 }
                 let planning_duration = start_planning.elapsed();
-                let (results, explanation) =
-                    match self
-                        .evaluator
-                        .simple_evaluator(dataset, self.dataset, base_iri)
-                    {
-                        Ok(evaluator) => evaluator.evaluate_select(&pattern, self.substitutions),
-                        Err(e) => (Err(e), Rc::new(EvalNodeWithStats::empty())),
-                    };
+                let (results, explanation, transitive_path_stats) = match self
+                    .evaluator
+                    .simple_evaluator(dataset, self.dataset, base_iri)
+                {
+                    Ok(evaluator) => {
+                        let (results, explanation) =
+                            evaluator.evaluate_select(&pattern, self.substitutions);
+                        (
+                            results,
+                            explanation,
+                            evaluator.transitive_path_stats_snapshot(),
+                        )
+                    }
+                    Err(e) => (
+                        Err(e),
+                        Rc::new(EvalNodeWithStats::empty()),
+                        TransitivePathStatsSnapshot::default(),
+                    ),
+                };
                 (
                     results.map(QueryResults::Solutions),
                     explanation,
                     planning_duration,
+                    transitive_path_stats,
                 )
             }
             Query::Ask {
@@ -703,18 +717,30 @@ impl PreparedQuery<'_> {
                     pattern = Optimizer::optimize_graph_pattern(pattern);
                 }
                 let planning_duration = start_planning.elapsed();
-                let (results, explanation) =
-                    match self
-                        .evaluator
-                        .simple_evaluator(dataset, self.dataset, base_iri)
-                    {
-                        Ok(evaluator) => evaluator.evaluate_ask(&pattern, self.substitutions),
-                        Err(e) => (Err(e), Rc::new(EvalNodeWithStats::empty())),
-                    };
+                let (results, explanation, transitive_path_stats) = match self
+                    .evaluator
+                    .simple_evaluator(dataset, self.dataset, base_iri)
+                {
+                    Ok(evaluator) => {
+                        let (results, explanation) =
+                            evaluator.evaluate_ask(&pattern, self.substitutions);
+                        (
+                            results,
+                            explanation,
+                            evaluator.transitive_path_stats_snapshot(),
+                        )
+                    }
+                    Err(e) => (
+                        Err(e),
+                        Rc::new(EvalNodeWithStats::empty()),
+                        TransitivePathStatsSnapshot::default(),
+                    ),
+                };
                 (
                     results.map(QueryResults::Boolean),
                     explanation,
                     planning_duration,
+                    transitive_path_stats,
                 )
             }
             Query::Construct {
@@ -728,20 +754,30 @@ impl PreparedQuery<'_> {
                     pattern = Optimizer::optimize_graph_pattern(pattern);
                 }
                 let planning_duration = start_planning.elapsed();
-                let (results, explanation) =
-                    match self
-                        .evaluator
-                        .simple_evaluator(dataset, self.dataset, base_iri)
-                    {
-                        Ok(evaluator) => {
-                            evaluator.evaluate_construct(&pattern, template, self.substitutions)
-                        }
-                        Err(e) => (Err(e), Rc::new(EvalNodeWithStats::empty())),
-                    };
+                let (results, explanation, transitive_path_stats) = match self
+                    .evaluator
+                    .simple_evaluator(dataset, self.dataset, base_iri)
+                {
+                    Ok(evaluator) => {
+                        let (results, explanation) =
+                            evaluator.evaluate_construct(&pattern, template, self.substitutions);
+                        (
+                            results,
+                            explanation,
+                            evaluator.transitive_path_stats_snapshot(),
+                        )
+                    }
+                    Err(e) => (
+                        Err(e),
+                        Rc::new(EvalNodeWithStats::empty()),
+                        TransitivePathStatsSnapshot::default(),
+                    ),
+                };
                 (
                     results.map(QueryResults::Graph),
                     explanation,
                     planning_duration,
+                    transitive_path_stats,
                 )
             }
             Query::Describe {
@@ -752,18 +788,30 @@ impl PreparedQuery<'_> {
                     pattern = Optimizer::optimize_graph_pattern(pattern);
                 }
                 let planning_duration = start_planning.elapsed();
-                let (results, explanation) =
-                    match self
-                        .evaluator
-                        .simple_evaluator(dataset, self.dataset, base_iri)
-                    {
-                        Ok(evaluator) => evaluator.evaluate_describe(&pattern, self.substitutions),
-                        Err(e) => (Err(e), Rc::new(EvalNodeWithStats::empty())),
-                    };
+                let (results, explanation, transitive_path_stats) = match self
+                    .evaluator
+                    .simple_evaluator(dataset, self.dataset, base_iri)
+                {
+                    Ok(evaluator) => {
+                        let (results, explanation) =
+                            evaluator.evaluate_describe(&pattern, self.substitutions);
+                        (
+                            results,
+                            explanation,
+                            evaluator.transitive_path_stats_snapshot(),
+                        )
+                    }
+                    Err(e) => (
+                        Err(e),
+                        Rc::new(EvalNodeWithStats::empty()),
+                        TransitivePathStatsSnapshot::default(),
+                    ),
+                };
                 (
                     results.map(QueryResults::Graph),
                     explanation,
                     planning_duration,
+                    transitive_path_stats,
                 )
             }
         };
@@ -771,6 +819,7 @@ impl PreparedQuery<'_> {
             inner: plan_node_with_stats,
             with_stats: self.evaluator.run_stats,
             planning_duration,
+            transitive_path_stats: self.evaluator.run_stats.then_some(transitive_path_stats),
         };
         (results, explanation)
     }
@@ -1040,6 +1089,7 @@ pub struct QueryExplanation {
     inner: Rc<EvalNodeWithStats>,
     with_stats: bool,
     planning_duration: Option<DayTimeDuration>,
+    transitive_path_stats: Option<TransitivePathStatsSnapshot>,
 }
 
 impl QueryExplanation {
@@ -1053,6 +1103,36 @@ impl QueryExplanation {
             serializer.serialize_event(JsonEvent::Number(
                 planning_duration.as_seconds().to_string().into(),
             ))?;
+        }
+        if let Some(stats) = self.transitive_path_stats {
+            serializer
+                .serialize_event(JsonEvent::ObjectKey("transitive path cache stats".into()))?;
+            serializer.serialize_event(JsonEvent::StartObject)?;
+            serializer.serialize_event(JsonEvent::ObjectKey("transitive_index_builds".into()))?;
+            serializer.serialize_event(JsonEvent::Number(
+                stats.transitive_index_builds.to_string().into(),
+            ))?;
+            serializer
+                .serialize_event(JsonEvent::ObjectKey("transitive_closure_cache_hits".into()))?;
+            serializer.serialize_event(JsonEvent::Number(
+                stats.transitive_closure_cache_hits.to_string().into(),
+            ))?;
+            serializer.serialize_event(JsonEvent::ObjectKey(
+                "transitive_closure_cache_misses".into(),
+            ))?;
+            serializer.serialize_event(JsonEvent::Number(
+                stats.transitive_closure_cache_misses.to_string().into(),
+            ))?;
+            serializer
+                .serialize_event(JsonEvent::ObjectKey("transitive_reachability_tests".into()))?;
+            serializer.serialize_event(JsonEvent::Number(
+                stats.transitive_reachability_tests.to_string().into(),
+            ))?;
+            serializer.serialize_event(JsonEvent::ObjectKey("transitive_enumerations".into()))?;
+            serializer.serialize_event(JsonEvent::Number(
+                stats.transitive_enumerations.to_string().into(),
+            ))?;
+            serializer.serialize_event(JsonEvent::EndObject)?;
         }
         serializer.serialize_event(JsonEvent::ObjectKey("plan".into()))?;
         self.inner.json_node(&mut serializer, self.with_stats)?;
@@ -1068,6 +1148,9 @@ impl fmt::Debug for QueryExplanation {
                 "planning duration in seconds",
                 &f32::from(Float::from(planning_duration.as_seconds())),
             );
+        }
+        if let Some(stats) = self.transitive_path_stats {
+            obj.field("transitive path cache stats", &stats);
         }
         obj.field("tree", &self.inner);
         obj.finish_non_exhaustive()

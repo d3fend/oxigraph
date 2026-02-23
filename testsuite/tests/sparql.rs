@@ -48,17 +48,7 @@ fn sparql10_w3c_query_evaluation_testsuite() -> Result<()> {
 fn sparql11_query_w3c_evaluation_testsuite() -> Result<()> {
     check_testsuite(
         "https://w3c.github.io/rdf-tests/sparql/sparql11/manifest-sparql11-query.ttl",
-        &[
-            // Our scoping of variables introduced by GRAPH is wrong
-            "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/negation/manifest#graph-minus",
-            "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg-empty-group-count-graph",
-            "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/bindings/manifest#graph",
-            // Our property path handling is wrong
-            "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#zero_or_more_set_start",
-            "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#zero_or_more_set_end",
-            "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#zero_or_one_set_start",
-            "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#zero_or_one_set_end",
-        ],
+        &[],
     )
 }
 
@@ -66,10 +56,7 @@ fn sparql11_query_w3c_evaluation_testsuite() -> Result<()> {
 fn sparql11_federation_w3c_evaluation_testsuite() -> Result<()> {
     check_testsuite(
         "https://w3c.github.io/rdf-tests/sparql/sparql11/manifest-sparql11-fed.ttl",
-        &[
-            // Problem during service evaluation order
-            "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/service/manifest#service5",
-        ],
+        &[],
     )
 }
 
@@ -93,12 +80,7 @@ fn sparql11_json_w3c_evaluation_testsuite() -> Result<()> {
 fn sparql11_tsv_w3c_evaluation_testsuite() -> Result<()> {
     check_testsuite(
         "https://w3c.github.io/rdf-tests/sparql/sparql11/csv-tsv-res/manifest.ttl",
-        &[
-            // We do not run CSVResultFormatTest tests yet
-            "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/csv-tsv-res/manifest#csv01",
-            "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/csv-tsv-res/manifest#csv02",
-            "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/csv-tsv-res/manifest#csv03",
-        ],
+        &[],
     )
 }
 

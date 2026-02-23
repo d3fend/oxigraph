@@ -767,6 +767,55 @@ impl GraphPattern {
         }
     }
 
+    fn with_input_dependent_service_as_lateral(self) -> Self {
+        #[cfg(feature = "sep-0006")]
+        if let Self::Join { left, right, .. } = self {
+            if Self::contains_input_dependent_service(&right) {
+                return Self::lateral(*left, *right);
+            }
+            return Self::Join {
+                left,
+                right,
+                algorithm: JoinAlgorithm::default(),
+            };
+        }
+        self
+    }
+
+    fn contains_input_dependent_service(pattern: &Self) -> bool {
+        match pattern {
+            Self::Service {
+                name: NamedNodePattern::Variable(_),
+                ..
+            } => true,
+            Self::Join { left, right, .. }
+            | Self::LeftJoin { left, right, .. }
+            | Self::Minus { left, right, .. } => {
+                Self::contains_input_dependent_service(left)
+                    || Self::contains_input_dependent_service(right)
+            }
+            #[cfg(feature = "sep-0006")]
+            Self::Lateral { left, right } => {
+                Self::contains_input_dependent_service(left)
+                    || Self::contains_input_dependent_service(right)
+            }
+            Self::Filter { inner, .. }
+            | Self::Extend { inner, .. }
+            | Self::OrderBy { inner, .. }
+            | Self::Project { inner, .. }
+            | Self::Distinct { inner }
+            | Self::Reduced { inner }
+            | Self::Slice { inner, .. }
+            | Self::Group { inner, .. }
+            | Self::Service { inner, .. } => Self::contains_input_dependent_service(inner),
+            Self::Union { inner } => inner.iter().any(Self::contains_input_dependent_service),
+            Self::QuadPattern { .. }
+            | Self::Path { .. }
+            | Self::Graph { .. }
+            | Self::Values { .. } => false,
+        }
+    }
+
     #[cfg(feature = "sep-0006")]
     pub fn lateral(left: Self, right: Self) -> Self {
         if left.is_empty() || right.is_empty() {
@@ -989,7 +1038,7 @@ impl GraphPattern {
         variables: Vec<Variable>,
         aggregates: Vec<(Variable, AggregateExpression)>,
     ) -> Self {
-        if inner.is_empty() {
+        if inner.is_empty() && !variables.is_empty() {
             return Self::empty();
         }
         Self::Group {
@@ -1150,11 +1199,12 @@ impl GraphPattern {
                 object: Self::term_pattern_from_algebra(object, blank_nodes),
                 graph_name: graph_name.cloned(),
             },
-            AlGraphPattern::Join { left, right } => Self::Join {
-                left: Box::new(Self::from_sparql_algebra(left, graph_name, blank_nodes)),
-                right: Box::new(Self::from_sparql_algebra(right, graph_name, blank_nodes)),
-                algorithm: JoinAlgorithm::default(),
-            },
+            AlGraphPattern::Join { left, right } => Self::join(
+                Self::from_sparql_algebra(left, graph_name, blank_nodes),
+                Self::from_sparql_algebra(right, graph_name, blank_nodes),
+                JoinAlgorithm::default(),
+            )
+            .with_input_dependent_service_as_lateral(),
             AlGraphPattern::LeftJoin {
                 left,
                 right,
@@ -1184,7 +1234,30 @@ impl GraphPattern {
                 ],
             },
             AlGraphPattern::Graph { inner, name } => {
-                Self::from_sparql_algebra(inner, Some(name), blank_nodes)
+                let inner = Self::from_sparql_algebra(inner, Some(name), blank_nodes);
+                if matches!(name, NamedNodePattern::Variable(_)) {
+                    #[cfg(feature = "sep-0006")]
+                    {
+                        Self::lateral(
+                            Self::Graph {
+                                graph_name: name.clone(),
+                            },
+                            inner,
+                        )
+                    }
+                    #[cfg(not(feature = "sep-0006"))]
+                    {
+                        Self::join(
+                            Self::Graph {
+                                graph_name: name.clone(),
+                            },
+                            inner,
+                            JoinAlgorithm::default(),
+                        )
+                    }
+                } else {
+                    inner
+                }
             }
             AlGraphPattern::Extend {
                 inner,
@@ -1234,14 +1307,25 @@ impl GraphPattern {
                 }
             }
             AlGraphPattern::Project { inner, variables } => {
+                let mut variables = variables.clone();
                 let graph_name = if let Some(NamedNodePattern::Variable(graph_name)) = graph_name {
-                    Some(NamedNodePattern::Variable(
-                        if variables.contains(graph_name) {
-                            graph_name.clone()
-                        } else {
-                            new_var()
-                        },
-                    ))
+                    let mut graph_name_used_in_inner = false;
+                    inner.on_in_scope_variable(|v| {
+                        if v == graph_name {
+                            graph_name_used_in_inner = true;
+                        }
+                    });
+                    if variables.contains(graph_name) || !graph_name_used_in_inner {
+                        if !variables.contains(graph_name) && !graph_name_used_in_inner {
+                            // Preserve implicit GRAPH scoping through subquery projections.
+                            variables.push(graph_name.clone());
+                        }
+                        Some(NamedNodePattern::Variable(graph_name.clone()))
+                    } else {
+                        // If the graph variable is explicitly reused inside the subquery,
+                        // isolate it to preserve SPARQL subquery scoping.
+                        Some(NamedNodePattern::Variable(new_var()))
+                    }
                 } else {
                     graph_name.cloned()
                 };
@@ -1251,7 +1335,7 @@ impl GraphPattern {
                         graph_name.as_ref(),
                         &mut HashMap::new(),
                     )),
-                    variables: variables.clone(),
+                    variables,
                 }
             }
             AlGraphPattern::Distinct { inner } => Self::Distinct {

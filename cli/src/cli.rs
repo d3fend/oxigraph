@@ -204,6 +204,9 @@ pub enum Command {
         /// Beware, computing the statistics adds some overhead to the evaluation runtime.
         #[arg(long)]
         stats: bool,
+        /// Disables SPARQL query optimizer rewrites
+        #[arg(long)]
+        without_optimizations: bool,
         /// If the SPARQL queries should look for triples in all the dataset graphs by default (ie. without `GRAPH` operations)
         #[arg(long)]
         union_default_graph: bool,
