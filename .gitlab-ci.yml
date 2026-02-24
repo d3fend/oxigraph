@@ -1,0 +1,63 @@
+# CI is cert-blind.
+# If enterprise certs are required, they must already be present in `.local/`
+# before `docker build` runs.
+
+stages:
+  - build
+  - test
+  - deploy
+
+variables:
+  IMAGE_LOCAL: "oxigraph-ci:${CI_COMMIT_SHA}"
+
+build:
+  stage: build
+  script:
+    - docker build -f d3fend.Dockerfile -t "${IMAGE_LOCAL}" .
+    - docker save "${IMAGE_LOCAL}" -o oxigraph-image.tar
+  artifacts:
+    paths:
+      - oxigraph-image.tar
+    expire_in: 1 day
+
+test:
+  stage: test
+  dependencies:
+    - build
+  script:
+    - docker load -i oxigraph-image.tar
+    - docker run -d --rm --name oxigraph-ci -p 127.0.0.1::7878 "${IMAGE_LOCAL}"
+    - HOST_PORT="$(docker port oxigraph-ci 7878/tcp | sed 's/.*://')"
+    - test -n "${HOST_PORT}"
+    - docker ps --filter "name=oxigraph-ci" --filter "status=running" --format '{{.Names}}' | grep -q '^oxigraph-ci$'
+    - |
+      if ! command -v curl >/dev/null 2>&1; then
+        echo "curl is required for smoke test."
+        exit 1
+      fi
+      for i in $(seq 1 45); do
+        curl --silent --show-error --fail \
+          -X POST \
+          -H "Content-Type: application/sparql-query" \
+          --data 'ASK { }' \
+          "http://127.0.0.1:${HOST_PORT}/query" >/dev/null && exit 0
+        sleep 1
+      done
+      echo "Oxigraph /query smoke test failed."
+      exit 1
+  after_script:
+    - docker logs oxigraph-ci || true
+    - docker stop oxigraph-ci || true
+
+deploy-builder:
+  stage: deploy
+  needs:
+    - test
+  trigger:
+    project: D3FEND/d3fend-builder
+    strategy: depend
+  variables:
+    OXIGRAPH_REF: $CI_COMMIT_REF_NAME
+    OXIGRAPH_SHA: $CI_COMMIT_SHA
+  rules:
+    - if: '$CI_COMMIT_BRANCH'
