@@ -4,10 +4,11 @@ use crate::algebra::{
 use crate::type_inference::{
     VariableType, VariableTypes, infer_expression_type, infer_graph_pattern_types,
 };
-use oxrdf::Variable;
+use oxrdf::{NamedNode, Variable};
 use spargebra::algebra::PropertyPathExpression;
 use spargebra::term::{GroundTermPattern, NamedNodePattern};
 use std::cmp::{max, min};
+use std::collections::HashSet;
 use std::env;
 use std::sync::OnceLock;
 
@@ -20,7 +21,9 @@ const DEFAULT_OPEN_TRANSITIVE_PATH_FACTOR: usize = 100_000;
 const DEFAULT_OPEN_TRANSITIVE_PATH_MIN_COST: usize = 1_000_000;
 const DEFAULT_OPEN_TRANSITIVE_PATH_FULL_SCAN_COST: usize = 1_000_000_000;
 const DEFAULT_TRANSITIVE_LATERAL_MAX_LEFT_SIZE: usize = 16;
+const DEFAULT_SUBCLASS_TRANSITIVE_LATERAL_MAX_LEFT_SIZE: usize = 10_000;
 const DEFAULT_SUBCLASS_FOR_LOOP_MAX_LEFT_SIZE: usize = 10_000;
+const DEFAULT_FILTER_EXISTS_REORDER_MIN_CORRELATED_VARS: usize = 5;
 const DEFAULT_JOIN_UNION_DISTRIBUTION_MAX_FACTOR_COST: usize = 1_000_000;
 const DEFAULT_JOIN_UNION_DISTRIBUTION_MAX_BRANCHES: usize = 8;
 const RDFS_SUBCLASS_OF_IRI: &str = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
@@ -70,6 +73,16 @@ fn transitive_lateral_max_left_size() -> usize {
     })
 }
 
+fn subclass_transitive_lateral_max_left_size() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        env::var("OXIGRAPH_SUBCLASS_TRANSITIVE_LATERAL_MAX_LEFT_SIZE")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(DEFAULT_SUBCLASS_TRANSITIVE_LATERAL_MAX_LEFT_SIZE)
+    })
+}
+
 fn subclass_for_loop_max_left_size() -> usize {
     static VALUE: OnceLock<usize> = OnceLock::new();
     *VALUE.get_or_init(|| {
@@ -77,6 +90,16 @@ fn subclass_for_loop_max_left_size() -> usize {
             .ok()
             .and_then(|value| value.trim().parse::<usize>().ok())
             .unwrap_or(DEFAULT_SUBCLASS_FOR_LOOP_MAX_LEFT_SIZE)
+    })
+}
+
+fn filter_exists_reorder_min_correlated_vars() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        env::var("OXIGRAPH_FILTER_EXISTS_REORDER_MIN_CORRELATED_VARS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(DEFAULT_FILTER_EXISTS_REORDER_MIN_CORRELATED_VARS)
     })
 }
 
@@ -102,9 +125,16 @@ fn join_union_distribution_max_branches() -> usize {
 
 impl Optimizer {
     pub fn optimize_graph_pattern(pattern: GraphPattern) -> GraphPattern {
-        let pattern = Self::normalize_pattern(pattern, &VariableTypes::default());
-        let pattern = Self::reorder_joins(pattern, &VariableTypes::default());
-        Self::push_filters(pattern, Vec::new(), &VariableTypes::default())
+        Self::optimize_graph_pattern_with_input_types(pattern, &VariableTypes::default())
+    }
+
+    fn optimize_graph_pattern_with_input_types(
+        pattern: GraphPattern,
+        input_types: &VariableTypes,
+    ) -> GraphPattern {
+        let pattern = Self::normalize_pattern(pattern, input_types);
+        let pattern = Self::reorder_joins(pattern, input_types);
+        Self::push_filters(pattern, Vec::new(), input_types)
     }
 
     /// Normalize the pattern, discarding any join ordering information
@@ -590,6 +620,13 @@ impl Optimizer {
             GraphPattern::Join { left, right, .. } => {
                 let left = *left;
                 let right = *right;
+                if let Some(rewritten) = rewrite_inner_join_with_correlated_filter_only_union_branch(
+                    left.clone(),
+                    right.clone(),
+                    input_types,
+                ) {
+                    return Self::reorder_joins(rewritten, input_types);
+                }
                 if let Some(rewritten) = rewrite_inner_join_with_small_factor_union(
                     left.clone(),
                     right.clone(),
@@ -603,6 +640,11 @@ impl Optimizer {
                     input_types,
                 ) {
                     return Self::reorder_joins(rewritten, input_types);
+                }
+                if let Some(fallback) =
+                    guarded_singleton_union_inner_join_fallback(left.clone(), right.clone(), input_types)
+                {
+                    return fallback;
                 }
                 // We flatten the join operation
                 let mut to_reorder = Vec::new();
@@ -628,20 +670,21 @@ impl Optimizer {
                 {
                     return Self::reorder_joins(rewritten, input_types);
                 }
-                if let Some((singleton_union_index, non_singleton_branches)) =
-                    to_reorder.iter().enumerate().find_map(|(index, pattern)| {
-                        split_singleton_union_branches(pattern).and_then(
-                            |(singleton_branch_count, non_singleton_branches)| {
-                                if singleton_branch_count == 1 {
-                                    Some((index, non_singleton_branches))
-                                } else {
-                                    None
-                                }
-                            },
-                        )
-                    })
+                if to_reorder.len() > 2
+                    && let Some((singleton_union_index, non_singleton_branches)) =
+                        to_reorder.iter().enumerate().find_map(|(index, pattern)| {
+                            split_singleton_union_branches(pattern).and_then(
+                                |(singleton_branch_count, non_singleton_branches)| {
+                                    if singleton_branch_count == 1 {
+                                        Some((index, non_singleton_branches))
+                                    } else {
+                                        None
+                                    }
+                                },
+                            )
+                        })
                 {
-                    let mut base_factors = to_reorder;
+                    let mut base_factors = to_reorder.clone();
                     base_factors.remove(singleton_union_index);
                     let base_join = Self::reorder_joins(
                         join_all_factors(base_factors.clone())
@@ -650,6 +693,32 @@ impl Optimizer {
                     );
                     if non_singleton_branches.is_empty() {
                         return base_join;
+                    }
+                    if should_avoid_singleton_union_duplication(&base_join, input_types) {
+                        if base_factors.iter().any(|factor| {
+                            should_avoid_singleton_union_duplication(factor, input_types)
+                        }) {
+                            if let Some(rewritten) =
+                                rewrite_flat_join_with_guarded_singleton_union_branch(
+                                    base_factors.clone(),
+                                    non_singleton_branches.clone(),
+                                    input_types,
+                                )
+                            {
+                                return rewritten;
+                            }
+                        }
+                        let mut reordered_base_factors = Vec::new();
+                        flatten_inner_join_factors(base_join.clone(), &mut reordered_base_factors);
+                        if let Some(rewritten) =
+                            rewrite_flat_join_with_guarded_singleton_union_branch(
+                                reordered_base_factors,
+                                non_singleton_branches.clone(),
+                                input_types,
+                            )
+                        {
+                            return rewritten;
+                        }
                     }
                     let mut branch_factors = base_factors;
                     branch_factors.push(GraphPattern::union_all(non_singleton_branches));
@@ -700,7 +769,8 @@ impl Optimizer {
                         .min_by_key(|i| {
                             #[cfg(feature = "sep-0006")]
                             let join_cost = {
-                                let output_size = estimate_graph_pattern_size(&output, input_types);
+                                let output_size =
+                                    estimate_for_loop_entry_size(&output, input_types);
                                 if is_fit_for_for_loop_join(
                                     &to_reorder[*i],
                                     input_types,
@@ -751,14 +821,17 @@ impl Optimizer {
                         let next = to_reorder[next_id].clone();
                         #[cfg(feature = "sep-0006")]
                         {
-                            let output_size = estimate_graph_pattern_size(&output, input_types);
+                            let output_size = estimate_for_loop_entry_size(&output, input_types);
                             output = if is_fit_for_for_loop_join(
                                 &next,
                                 input_types,
                                 &output_types,
                                 output_size,
                             ) {
-                                GraphPattern::lateral(output, next)
+                                GraphPattern::lateral(
+                                    output,
+                                    Self::reorder_joins(next, &output_types),
+                                )
                             } else {
                                 GraphPattern::join(
                                     output,
@@ -834,11 +907,26 @@ impl Optimizer {
                 let left = Self::reorder_joins(*left, input_types);
                 let left_types = infer_graph_pattern_types(&left, input_types.clone());
                 let right = Self::reorder_joins(*right, input_types);
+                let right_types = infer_graph_pattern_types(&right, input_types.clone());
                 if expression.effective_boolean_value() == Some(true) {
                     if let Some((singleton_branch_count, non_singleton_branches)) =
                         split_singleton_union_branches(&right)
                     {
                         if singleton_branch_count == 1 {
+                            if should_avoid_singleton_union_duplication(&left, input_types) {
+                                return GraphPattern::left_join(
+                                    left,
+                                    right,
+                                    expression,
+                                    LeftJoinAlgorithm::HashBuildRightProbeLeft {
+                                        keys: join_key_variables(
+                                            &left_types,
+                                            &right_types,
+                                            input_types,
+                                        ),
+                                    },
+                                );
+                            }
                             if non_singleton_branches.is_empty() {
                                 return left;
                             }
@@ -865,7 +953,6 @@ impl Optimizer {
                         }
                     }
                 }
-                let right_types = infer_graph_pattern_types(&right, input_types.clone());
                 #[cfg(feature = "sep-0006")]
                 {
                     let left_size = estimate_graph_pattern_size(&left, input_types);
@@ -909,13 +996,14 @@ impl Optimizer {
                 inner,
                 expression,
                 variable,
-            } => GraphPattern::extend(
-                Self::reorder_joins(*inner, input_types),
-                variable,
-                expression,
-            ),
+            } => GraphPattern::extend(Self::reorder_joins(*inner, input_types), variable, expression),
             GraphPattern::Filter { inner, expression } => {
-                GraphPattern::filter(Self::reorder_joins(*inner, input_types), expression)
+                let inner = Self::reorder_joins(*inner, input_types);
+                let inner_types = infer_graph_pattern_types(&inner, input_types.clone());
+                GraphPattern::filter(
+                    inner,
+                    Self::reorder_filter_exists_expressions(expression, &inner_types),
+                )
             }
             GraphPattern::Union { inner } => GraphPattern::union_all(
                 inner
@@ -954,6 +1042,225 @@ impl Optimizer {
             ),
         }
     }
+
+    fn reorder_filter_exists_expressions(
+        expression: Expression,
+        input_types: &VariableTypes,
+    ) -> Expression {
+        match expression {
+            Expression::NamedNode(_)
+            | Expression::Literal(_)
+            | Expression::Variable(_)
+            | Expression::Bound(_) => expression,
+            Expression::Or(inner) => Expression::or_all(
+                inner
+                    .into_iter()
+                    .map(|e| Self::reorder_filter_exists_expressions(e, input_types))
+                    .collect::<Vec<_>>(),
+            ),
+            Expression::And(inner) => Expression::and_all(
+                inner
+                    .into_iter()
+                    .map(|e| Self::reorder_filter_exists_expressions(e, input_types))
+                    .collect::<Vec<_>>(),
+            ),
+            Expression::Equal(left, right) => Expression::equal(
+                Self::reorder_filter_exists_expressions(*left, input_types),
+                Self::reorder_filter_exists_expressions(*right, input_types),
+            ),
+            Expression::SameTerm(left, right) => Expression::same_term(
+                Self::reorder_filter_exists_expressions(*left, input_types),
+                Self::reorder_filter_exists_expressions(*right, input_types),
+            ),
+            Expression::Greater(left, right) => Expression::greater(
+                Self::reorder_filter_exists_expressions(*left, input_types),
+                Self::reorder_filter_exists_expressions(*right, input_types),
+            ),
+            Expression::GreaterOrEqual(left, right) => Expression::greater_or_equal(
+                Self::reorder_filter_exists_expressions(*left, input_types),
+                Self::reorder_filter_exists_expressions(*right, input_types),
+            ),
+            Expression::Less(left, right) => Expression::less(
+                Self::reorder_filter_exists_expressions(*left, input_types),
+                Self::reorder_filter_exists_expressions(*right, input_types),
+            ),
+            Expression::LessOrEqual(left, right) => Expression::less_or_equal(
+                Self::reorder_filter_exists_expressions(*left, input_types),
+                Self::reorder_filter_exists_expressions(*right, input_types),
+            ),
+            Expression::Add(left, right) => {
+                Self::reorder_filter_exists_expressions(*left, input_types)
+                    + Self::reorder_filter_exists_expressions(*right, input_types)
+            }
+            Expression::Subtract(left, right) => {
+                Self::reorder_filter_exists_expressions(*left, input_types)
+                    - Self::reorder_filter_exists_expressions(*right, input_types)
+            }
+            Expression::Multiply(left, right) => {
+                Self::reorder_filter_exists_expressions(*left, input_types)
+                    * Self::reorder_filter_exists_expressions(*right, input_types)
+            }
+            Expression::Divide(left, right) => {
+                Self::reorder_filter_exists_expressions(*left, input_types)
+                    / Self::reorder_filter_exists_expressions(*right, input_types)
+            }
+            Expression::UnaryPlus(inner) => {
+                Expression::unary_plus(Self::reorder_filter_exists_expressions(*inner, input_types))
+            }
+            Expression::UnaryMinus(inner) => {
+                -Self::reorder_filter_exists_expressions(*inner, input_types)
+            }
+            Expression::Not(inner) => !Self::reorder_filter_exists_expressions(*inner, input_types),
+            Expression::If(cond, then, els) => Expression::if_cond(
+                Self::reorder_filter_exists_expressions(*cond, input_types),
+                Self::reorder_filter_exists_expressions(*then, input_types),
+                Self::reorder_filter_exists_expressions(*els, input_types),
+            ),
+            Expression::Coalesce(inner) => Expression::coalesce(
+                inner
+                    .into_iter()
+                    .map(|e| Self::reorder_filter_exists_expressions(e, input_types))
+                    .collect::<Vec<_>>(),
+            ),
+            Expression::Exists(inner) => {
+                if should_reorder_highly_correlated_filter_exists(&inner, input_types) {
+                    Expression::exists(Self::optimize_graph_pattern_with_input_types(
+                        *inner,
+                        input_types,
+                    ))
+                } else {
+                    Expression::exists(*inner)
+                }
+            }
+            Expression::FunctionCall(name, args) => Expression::call(
+                name,
+                args.into_iter()
+                    .map(|e| Self::reorder_filter_exists_expressions(e, input_types))
+                    .collect::<Vec<_>>(),
+            ),
+        }
+    }
+}
+
+fn should_reorder_highly_correlated_filter_exists(
+    inner: &GraphPattern,
+    input_types: &VariableTypes,
+) -> bool {
+    count_outer_bound_variables_used_in_pattern(inner, input_types)
+        >= filter_exists_reorder_min_correlated_vars()
+        && graph_pattern_contains_kleene_subclass_path(inner)
+        && !matches!(
+            inner,
+            GraphPattern::Union { .. } | GraphPattern::Group { .. } | GraphPattern::Service { .. }
+        )
+}
+
+fn count_outer_bound_variables_used_in_pattern(
+    pattern: &GraphPattern,
+    input_types: &VariableTypes,
+) -> usize {
+    let mut variables = HashSet::new();
+    pattern.lookup_used_variables(&mut |variable| {
+        variables.insert(variable.clone());
+    });
+    variables
+        .into_iter()
+        .filter(|variable| input_types.get(variable) != VariableType::UNDEF)
+        .count()
+}
+
+fn graph_pattern_contains_kleene_subclass_path(pattern: &GraphPattern) -> bool {
+    match pattern {
+        GraphPattern::Path { path, .. } => {
+            rdfs_subclass_of_kleene_transitive_path_bound_endpoint(path).is_some()
+        }
+        GraphPattern::Join { left, right, .. }
+        | GraphPattern::LeftJoin { left, right, .. }
+        | GraphPattern::Minus { left, right, .. } => {
+            graph_pattern_contains_kleene_subclass_path(left)
+                || graph_pattern_contains_kleene_subclass_path(right)
+        }
+        #[cfg(feature = "sep-0006")]
+        GraphPattern::Lateral { left, right } => {
+            graph_pattern_contains_kleene_subclass_path(left)
+                || graph_pattern_contains_kleene_subclass_path(right)
+        }
+        GraphPattern::Filter { inner, expression } => {
+            graph_pattern_contains_kleene_subclass_path(inner)
+                || expression_contains_kleene_subclass_path(expression)
+        }
+        GraphPattern::Extend {
+            inner, expression, ..
+        } => {
+            graph_pattern_contains_kleene_subclass_path(inner)
+                || expression_contains_kleene_subclass_path(expression)
+        }
+        GraphPattern::OrderBy { inner, expression } => {
+            graph_pattern_contains_kleene_subclass_path(inner)
+                || expression
+                    .iter()
+                    .any(order_expression_contains_kleene_subclass_path)
+        }
+        GraphPattern::Project { inner, .. }
+        | GraphPattern::Distinct { inner }
+        | GraphPattern::Reduced { inner }
+        | GraphPattern::Slice { inner, .. }
+        | GraphPattern::Group { inner, .. }
+        | GraphPattern::Service { inner, .. } => {
+            graph_pattern_contains_kleene_subclass_path(inner)
+        }
+        GraphPattern::Union { inner } => inner
+            .iter()
+            .any(graph_pattern_contains_kleene_subclass_path),
+        GraphPattern::QuadPattern { .. }
+        | GraphPattern::Values { .. }
+        | GraphPattern::Graph { .. } => false,
+    }
+}
+
+fn order_expression_contains_kleene_subclass_path(expression: &OrderExpression) -> bool {
+    match expression {
+        OrderExpression::Asc(expression) | OrderExpression::Desc(expression) => {
+            expression_contains_kleene_subclass_path(expression)
+        }
+    }
+}
+
+fn expression_contains_kleene_subclass_path(expression: &Expression) -> bool {
+    match expression {
+        Expression::NamedNode(_)
+        | Expression::Literal(_)
+        | Expression::Variable(_)
+        | Expression::Bound(_) => false,
+        Expression::Or(inner) | Expression::And(inner) | Expression::Coalesce(inner) => {
+            inner.iter().any(expression_contains_kleene_subclass_path)
+        }
+        Expression::Equal(left, right)
+        | Expression::SameTerm(left, right)
+        | Expression::Greater(left, right)
+        | Expression::GreaterOrEqual(left, right)
+        | Expression::Less(left, right)
+        | Expression::LessOrEqual(left, right)
+        | Expression::Add(left, right)
+        | Expression::Subtract(left, right)
+        | Expression::Multiply(left, right)
+        | Expression::Divide(left, right) => {
+            expression_contains_kleene_subclass_path(left)
+                || expression_contains_kleene_subclass_path(right)
+        }
+        Expression::UnaryPlus(inner)
+        | Expression::UnaryMinus(inner)
+        | Expression::Not(inner) => expression_contains_kleene_subclass_path(inner),
+        Expression::Exists(inner) => graph_pattern_contains_kleene_subclass_path(inner),
+        Expression::If(condition, then, els) => {
+            expression_contains_kleene_subclass_path(condition)
+                || expression_contains_kleene_subclass_path(then)
+                || expression_contains_kleene_subclass_path(els)
+        }
+        Expression::FunctionCall(_, arguments) => {
+            arguments.iter().any(expression_contains_kleene_subclass_path)
+        }
+    }
 }
 
 fn is_fit_for_for_loop_join(
@@ -982,11 +1289,17 @@ fn is_fit_for_for_loop_join(
             if !contains_kleene_transitive_path(path) {
                 return true;
             }
-            if entry_estimated_size > transitive_lateral_max_left_size() {
-                return false;
-            }
             let entry_start_bound = is_term_pattern_bound(subject, entry_types);
             let entry_end_bound = is_term_pattern_bound(object, entry_types);
+            if entry_estimated_size
+                > transitive_lateral_max_left_size_for_path(
+                    path,
+                    entry_start_bound,
+                    entry_end_bound,
+                )
+            {
+                return false;
+            }
             entry_start_bound || entry_end_bound
         }
         #[cfg(feature = "sep-0006")]
@@ -1064,8 +1377,44 @@ fn is_fit_for_for_loop_join(
             NamedNodePattern::NamedNode(_) => true,
             NamedNodePattern::Variable(v) => !entry_types.get(v).undef,
         },
-        GraphPattern::Join { .. }
-        | GraphPattern::Minus { .. }
+        GraphPattern::Join { .. } => {
+            if !graph_pattern_contains_kleene_subclass_path(pattern) {
+                return false;
+            }
+            let mut factors = Vec::new();
+            flatten_inner_join_factors(pattern.clone(), &mut factors);
+            let factor_types = factors
+                .iter()
+                .map(|factor| infer_graph_pattern_types(factor, global_input_types.clone()))
+                .collect::<Vec<_>>();
+            let mut current_types = entry_types.clone();
+            let mut not_yet_ordered = vec![true; factors.len()];
+            while let Some(next_id) = not_yet_ordered
+                .iter()
+                .enumerate()
+                .filter(|(_, remaining)| **remaining)
+                .map(|(idx, _)| idx)
+                .filter(|idx| {
+                    is_fit_for_for_loop_join(
+                        &factors[*idx],
+                        global_input_types,
+                        &current_types,
+                        entry_estimated_size,
+                    )
+                })
+                .min_by_key(|idx| {
+                    (
+                        estimate_graph_pattern_size(&factors[*idx], global_input_types),
+                        graph_pattern_reordering_penalty(&factors[*idx], &current_types),
+                    )
+                })
+            {
+                not_yet_ordered[next_id] = false;
+                current_types.intersect_with(factor_types[next_id].clone());
+            }
+            not_yet_ordered.into_iter().all(|remaining| !remaining)
+        }
+        GraphPattern::Minus { .. }
         | GraphPattern::OrderBy { .. }
         | GraphPattern::Distinct { .. }
         | GraphPattern::Reduced { .. }
@@ -1089,6 +1438,66 @@ fn contains_kleene_transitive_path(path: &PropertyPathExpression) -> bool {
         }
         PropertyPathExpression::ZeroOrMore(_) | PropertyPathExpression::OneOrMore(_) => true,
     }
+}
+
+fn transitive_lateral_max_left_size_for_path(
+    path: &PropertyPathExpression,
+    entry_start_bound: bool,
+    entry_end_bound: bool,
+) -> usize {
+    if is_entry_bound_for_rdfs_subclass_of_kleene_transitive_path(
+        path,
+        entry_start_bound,
+        entry_end_bound,
+    ) {
+        subclass_transitive_lateral_max_left_size()
+    } else {
+        transitive_lateral_max_left_size()
+    }
+}
+
+fn is_entry_bound_for_rdfs_subclass_of_kleene_transitive_path(
+    path: &PropertyPathExpression,
+    entry_start_bound: bool,
+    entry_end_bound: bool,
+) -> bool {
+    match rdfs_subclass_of_kleene_transitive_path_bound_endpoint(path) {
+        Some(TransitivePathBoundEndpoint::Start) => entry_start_bound,
+        Some(TransitivePathBoundEndpoint::End) => entry_end_bound,
+        None => false,
+    }
+}
+
+fn rdfs_subclass_of_kleene_transitive_path_bound_endpoint(
+    path: &PropertyPathExpression,
+) -> Option<TransitivePathBoundEndpoint> {
+    match path {
+        PropertyPathExpression::ZeroOrMore(inner) | PropertyPathExpression::OneOrMore(inner) => {
+            transitive_path_base_predicate(inner).and_then(|(predicate, start_is_forward)| {
+                (predicate.as_str() == RDFS_SUBCLASS_OF_IRI).then_some(if start_is_forward {
+                    TransitivePathBoundEndpoint::Start
+                } else {
+                    TransitivePathBoundEndpoint::End
+                })
+            })
+        }
+        _ => None,
+    }
+}
+
+fn transitive_path_base_predicate(path: &PropertyPathExpression) -> Option<(&NamedNode, bool)> {
+    match path {
+        PropertyPathExpression::NamedNode(predicate) => Some((predicate, true)),
+        PropertyPathExpression::Reverse(inner) => transitive_path_base_predicate(inner)
+            .map(|(predicate, start_is_forward)| (predicate, !start_is_forward)),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TransitivePathBoundEndpoint {
+    Start,
+    End,
 }
 
 fn are_all_expression_variables_bound(
@@ -1298,6 +1707,12 @@ fn rewrite_inner_join_with_singleton_union_branch(
         split_singleton_union_branches(&right)
     {
         if singleton_branch_count == 1 {
+            let reordered_left = Optimizer::reorder_joins(left.clone(), input_types);
+            if should_avoid_singleton_union_duplication(&left, input_types)
+                || should_avoid_singleton_union_duplication(&reordered_left, input_types)
+            {
+                return None;
+            }
             if non_singleton_branches.is_empty() {
                 return Some(left);
             }
@@ -1321,6 +1736,12 @@ fn rewrite_inner_join_with_singleton_union_branch(
         split_singleton_union_branches(&left)
     {
         if singleton_branch_count == 1 {
+            let reordered_right = Optimizer::reorder_joins(right.clone(), input_types);
+            if should_avoid_singleton_union_duplication(&right, input_types)
+                || should_avoid_singleton_union_duplication(&reordered_right, input_types)
+            {
+                return None;
+            }
             if non_singleton_branches.is_empty() {
                 return Some(right);
             }
@@ -1343,6 +1764,194 @@ fn rewrite_inner_join_with_singleton_union_branch(
     None
 }
 
+fn guarded_singleton_union_inner_join_fallback(
+    left: GraphPattern,
+    right: GraphPattern,
+    input_types: &VariableTypes,
+) -> Option<GraphPattern> {
+    let left = Optimizer::reorder_joins(left, input_types);
+    let right = Optimizer::reorder_joins(right, input_types);
+    let left_types = infer_graph_pattern_types(&left, input_types.clone());
+    let right_types = infer_graph_pattern_types(&right, input_types.clone());
+    if split_singleton_union_branches(&right).is_some_and(|(singleton_branch_count, _)| {
+        singleton_branch_count == 1
+            && should_avoid_singleton_union_duplication(&left, input_types)
+    }) {
+        return Some(GraphPattern::join(
+            left,
+            right,
+            JoinAlgorithm::HashBuildLeftProbeRight {
+                keys: join_key_variables(&left_types, &right_types, input_types),
+            },
+        ));
+    }
+    if split_singleton_union_branches(&left).is_some_and(|(singleton_branch_count, _)| {
+        singleton_branch_count == 1
+            && should_avoid_singleton_union_duplication(&right, input_types)
+    }) {
+        return Some(GraphPattern::join(
+            left,
+            right,
+            JoinAlgorithm::HashBuildLeftProbeRight {
+                keys: join_key_variables(&left_types, &right_types, input_types),
+            },
+        ));
+    }
+    None
+}
+
+fn should_avoid_singleton_union_duplication(
+    pattern: &GraphPattern,
+    input_types: &VariableTypes,
+) -> bool {
+    graph_pattern_contains_small_seeded_subclass_lookup_lateral(pattern, input_types)
+}
+
+fn graph_pattern_contains_small_seeded_subclass_lookup_lateral(
+    pattern: &GraphPattern,
+    input_types: &VariableTypes,
+) -> bool {
+    match pattern {
+        GraphPattern::Join { left, right, .. }
+        | GraphPattern::LeftJoin { left, right, .. }
+        | GraphPattern::Minus { left, right, .. } => {
+            graph_pattern_contains_small_seeded_subclass_lookup_lateral(left, input_types)
+                || graph_pattern_contains_small_seeded_subclass_lookup_lateral(right, input_types)
+        }
+        #[cfg(feature = "sep-0006")]
+        GraphPattern::Lateral { left, right } => {
+            let left_types = infer_graph_pattern_types(left, input_types.clone());
+            let right_has_small_seeded_subclass_lookup = matches!(
+                right.as_ref(),
+                GraphPattern::Path {
+                    subject,
+                    path,
+                    object,
+                    ..
+                } if bound_entry_variable_for_rdfs_subclass_of_kleene_transitive_path(
+                    path,
+                    subject,
+                    object,
+                    &left_types,
+                )
+                .is_some_and(|entry_variable| {
+                    graph_pattern_has_small_seeded_lookup_for_variable(
+                        left,
+                        entry_variable,
+                        input_types,
+                    )
+                })
+            );
+            right_has_small_seeded_subclass_lookup
+                || graph_pattern_contains_small_seeded_subclass_lookup_lateral(left, input_types)
+                || graph_pattern_contains_small_seeded_subclass_lookup_lateral(right, &left_types)
+        }
+        GraphPattern::Filter { inner, .. }
+        | GraphPattern::Extend { inner, .. }
+        | GraphPattern::OrderBy { inner, .. }
+        | GraphPattern::Group { inner, .. } => {
+            graph_pattern_contains_small_seeded_subclass_lookup_lateral(inner, input_types)
+        }
+        GraphPattern::Project { inner, .. }
+        | GraphPattern::Distinct { inner }
+        | GraphPattern::Reduced { inner }
+        | GraphPattern::Slice { inner, .. }
+        | GraphPattern::Service { inner, .. } => {
+            graph_pattern_contains_small_seeded_subclass_lookup_lateral(inner, input_types)
+        }
+        GraphPattern::Union { inner } => inner
+            .iter()
+            .any(|branch| {
+                graph_pattern_contains_small_seeded_subclass_lookup_lateral(branch, input_types)
+            }),
+        GraphPattern::Path { .. }
+        | GraphPattern::QuadPattern { .. }
+        | GraphPattern::Values { .. }
+        | GraphPattern::Graph { .. } => false,
+    }
+}
+
+#[cfg(feature = "sep-0006")]
+fn graph_pattern_has_small_seeded_lookup_for_variable(
+    pattern: &GraphPattern,
+    variable: &Variable,
+    input_types: &VariableTypes,
+) -> bool {
+    match pattern {
+        GraphPattern::Join { left, right, .. }
+        | GraphPattern::LeftJoin { left, right, .. }
+        | GraphPattern::Minus { left, right, .. } => {
+            graph_pattern_has_small_seeded_lookup_for_variable(left, variable, input_types)
+                || graph_pattern_has_small_seeded_lookup_for_variable(right, variable, input_types)
+        }
+        GraphPattern::Lateral { left, right } => {
+            let left_types = infer_graph_pattern_types(left, input_types.clone());
+            let right_types = infer_graph_pattern_types(right, left_types.clone());
+            let right_is_small_seeded_lookup =
+                matches!(right.as_ref(), GraphPattern::QuadPattern { .. })
+                    && left_types.get(variable).undef
+                    && !right_types.get(variable).undef
+                    && estimate_graph_pattern_size(left, input_types)
+                        <= subclass_transitive_lateral_max_left_size()
+                    && estimate_graph_pattern_size(right, &left_types)
+                        <= subclass_transitive_lateral_max_left_size();
+            right_is_small_seeded_lookup
+                || graph_pattern_has_small_seeded_lookup_for_variable(left, variable, input_types)
+                || graph_pattern_has_small_seeded_lookup_for_variable(
+                    right,
+                    variable,
+                    &left_types,
+                )
+        }
+        GraphPattern::Filter { inner, .. }
+        | GraphPattern::Extend { inner, .. }
+        | GraphPattern::OrderBy { inner, .. }
+        | GraphPattern::Group { inner, .. }
+        | GraphPattern::Project { inner, .. }
+        | GraphPattern::Distinct { inner }
+        | GraphPattern::Reduced { inner }
+        | GraphPattern::Slice { inner, .. }
+        | GraphPattern::Service { inner, .. } => {
+            graph_pattern_has_small_seeded_lookup_for_variable(inner, variable, input_types)
+        }
+        GraphPattern::Union { inner } => inner.iter().any(|branch| {
+            graph_pattern_has_small_seeded_lookup_for_variable(branch, variable, input_types)
+        }),
+        GraphPattern::Path { .. }
+        | GraphPattern::QuadPattern { .. }
+        | GraphPattern::Values { .. }
+        | GraphPattern::Graph { .. } => false,
+    }
+}
+
+#[cfg(feature = "sep-0006")]
+fn bound_entry_variable_for_rdfs_subclass_of_kleene_transitive_path<'a>(
+    path: &PropertyPathExpression,
+    subject: &'a GroundTermPattern,
+    object: &'a GroundTermPattern,
+    input_types: &VariableTypes,
+) -> Option<&'a Variable> {
+    match rdfs_subclass_of_kleene_transitive_path_bound_endpoint(path) {
+        Some(TransitivePathBoundEndpoint::Start) if is_term_pattern_bound(subject, input_types) => {
+            variable_in_term_pattern(subject)
+        }
+        Some(TransitivePathBoundEndpoint::End) if is_term_pattern_bound(object, input_types) => {
+            variable_in_term_pattern(object)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(feature = "sep-0006")]
+fn variable_in_term_pattern(pattern: &GroundTermPattern) -> Option<&Variable> {
+    match pattern {
+        GroundTermPattern::Variable(variable) => Some(variable),
+        GroundTermPattern::NamedNode(_) | GroundTermPattern::Literal(_) => None,
+        #[cfg(feature = "sparql-12")]
+        GroundTermPattern::Triple(_) => None,
+    }
+}
+
 fn rewrite_inner_join_with_small_factor_union(
     left: GraphPattern,
     right: GraphPattern,
@@ -1357,6 +1966,63 @@ fn rewrite_inner_join_with_small_factor_union(
         }
         _ => None,
     }
+}
+
+fn rewrite_inner_join_with_correlated_filter_only_union_branch(
+    left: GraphPattern,
+    right: GraphPattern,
+    input_types: &VariableTypes,
+) -> Option<GraphPattern> {
+    rewrite_correlated_filter_only_union_join(left.clone(), right.clone(), input_types).or_else(|| {
+        rewrite_correlated_filter_only_union_join(right, left, input_types)
+    })
+}
+
+fn rewrite_correlated_filter_only_union_join(
+    shared: GraphPattern,
+    union: GraphPattern,
+    input_types: &VariableTypes,
+) -> Option<GraphPattern> {
+    let GraphPattern::Union { inner } = union else {
+        return None;
+    };
+
+    let shared_types = infer_graph_pattern_types(&shared, input_types.clone());
+    let mut rewritten_branches = Vec::new();
+    let mut other_branches = Vec::new();
+
+    for branch in inner {
+        match branch {
+            GraphPattern::Filter { inner, expression }
+                if inner.is_empty_singleton()
+                    && expression_contains_highly_correlated_filter_exists(
+                        &expression,
+                        &shared_types,
+                    ) =>
+            {
+                rewritten_branches.push(GraphPattern::filter(shared.clone(), expression));
+            }
+            other => other_branches.push(other),
+        }
+    }
+
+    if rewritten_branches.is_empty() {
+        return None;
+    }
+
+    if !other_branches.is_empty() {
+        let other_union = GraphPattern::union_all(other_branches);
+        let other_types = infer_graph_pattern_types(&other_union, input_types.clone());
+        rewritten_branches.push(GraphPattern::join(
+            shared,
+            other_union,
+            JoinAlgorithm::HashBuildLeftProbeRight {
+                keys: join_key_variables(&shared_types, &other_types, input_types),
+            },
+        ));
+    }
+
+    Some(GraphPattern::union_all(rewritten_branches))
 }
 
 fn rewrite_flat_join_with_small_factor_union(
@@ -1453,6 +2119,94 @@ fn rewrite_flat_join_with_small_factor_union(
         join_all_factors(rewritten_factors).expect("rewritten factors should never be empty")
     };
     Some(rewritten)
+}
+
+fn rewrite_flat_join_with_guarded_singleton_union_branch(
+    base_factors: Vec<GraphPattern>,
+    non_singleton_branches: Vec<GraphPattern>,
+    input_types: &VariableTypes,
+) -> Option<GraphPattern> {
+    let right_without_singleton = GraphPattern::union_all(non_singleton_branches);
+    let base_join = join_all_factors(base_factors.clone())?;
+    let base_types = infer_graph_pattern_types(&base_join, input_types.clone());
+    let right_types = infer_graph_pattern_types(&right_without_singleton, input_types.clone());
+    let shared_keys = join_key_variables(&base_types, &right_types, input_types);
+    if shared_keys.is_empty() {
+        return None;
+    }
+
+    let factor_types = base_factors
+        .iter()
+        .map(|factor| infer_graph_pattern_types(factor, input_types.clone()))
+        .collect::<Vec<_>>();
+    let guarded_flags = base_factors
+        .iter()
+        .map(|factor| should_avoid_singleton_union_duplication(factor, input_types))
+        .collect::<Vec<_>>();
+
+    let mut remaining_keys = shared_keys.into_iter().collect::<HashSet<_>>();
+    let mut duplicated_indices = Vec::new();
+    let mut duplicated_has_unguarded_factor = false;
+
+    while !remaining_keys.is_empty() {
+        let next_index = base_factors
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| !duplicated_indices.contains(idx))
+            .filter_map(|(idx, factor)| {
+                let covered_keys = remaining_keys
+                    .iter()
+                    .filter(|variable| !factor_types[idx].get(variable).undef)
+                    .count();
+                (covered_keys > 0).then_some((
+                    idx,
+                    covered_keys,
+                    guarded_flags[idx],
+                    estimate_graph_pattern_size(factor, input_types),
+                ))
+            })
+            .max_by(|(_, left_covered, left_guarded, left_cost), (_, right_covered, right_guarded, right_cost)| {
+                left_covered
+                    .cmp(right_covered)
+                    .then_with(|| (!*left_guarded).cmp(&!*right_guarded))
+                    .then_with(|| right_cost.cmp(left_cost))
+            })?
+            .0;
+
+        duplicated_indices.push(next_index);
+        duplicated_has_unguarded_factor |= !guarded_flags[next_index];
+        remaining_keys.retain(|variable| factor_types[next_index].get(variable).undef);
+    }
+
+    if !duplicated_has_unguarded_factor {
+        return None;
+    }
+
+    let mut duplicated_factors = Vec::new();
+    let mut shared_factors = Vec::new();
+    for (idx, factor) in base_factors.into_iter().enumerate() {
+        if duplicated_indices.contains(&idx) {
+            duplicated_factors.push(factor);
+        } else {
+            shared_factors.push(factor);
+        }
+    }
+
+    let duplicated_join = join_all_factors(duplicated_factors.clone())?;
+    let branch_join = join_all_factors({
+        let mut branch_factors = duplicated_factors;
+        branch_factors.push(right_without_singleton);
+        branch_factors
+    })?;
+    let rewritten_union = GraphPattern::union_all([duplicated_join, branch_join]);
+
+    if shared_factors.is_empty() {
+        Some(rewritten_union)
+    } else {
+        let mut outer_factors = shared_factors;
+        outer_factors.push(rewritten_union);
+        join_all_factors(outer_factors)
+    }
 }
 
 fn distribute_small_factor_over_union(
@@ -1640,6 +2394,21 @@ fn estimate_graph_pattern_size(pattern: &GraphPattern, input_types: &VariableTyp
     }
 }
 
+#[cfg(feature = "sep-0006")]
+fn estimate_for_loop_entry_size(pattern: &GraphPattern, input_types: &VariableTypes) -> usize {
+    let estimate = estimate_graph_pattern_size(pattern, input_types);
+    if graph_pattern_contains_small_seeded_subclass_lookup_lateral(pattern, input_types) {
+        min(estimate, subclass_transitive_lateral_max_left_size())
+    } else {
+        estimate
+    }
+}
+
+#[cfg(not(feature = "sep-0006"))]
+fn estimate_for_loop_entry_size(pattern: &GraphPattern, input_types: &VariableTypes) -> usize {
+    estimate_graph_pattern_size(pattern, input_types)
+}
+
 fn estimate_join_cost(
     left: &GraphPattern,
     right: &GraphPattern,
@@ -1681,6 +2450,50 @@ fn estimate_triple_pattern_size(
     }
 }
 
+fn expression_contains_highly_correlated_filter_exists(
+    expression: &Expression,
+    input_types: &VariableTypes,
+) -> bool {
+    match expression {
+        Expression::Exists(inner) => should_reorder_highly_correlated_filter_exists(inner, input_types),
+        Expression::Or(inner) | Expression::And(inner) | Expression::Coalesce(inner) => inner
+            .iter()
+            .any(|expression| {
+                expression_contains_highly_correlated_filter_exists(expression, input_types)
+            }),
+        Expression::Equal(left, right)
+        | Expression::SameTerm(left, right)
+        | Expression::Greater(left, right)
+        | Expression::GreaterOrEqual(left, right)
+        | Expression::Less(left, right)
+        | Expression::LessOrEqual(left, right)
+        | Expression::Add(left, right)
+        | Expression::Subtract(left, right)
+        | Expression::Multiply(left, right)
+        | Expression::Divide(left, right) => {
+            expression_contains_highly_correlated_filter_exists(left, input_types)
+                || expression_contains_highly_correlated_filter_exists(right, input_types)
+        }
+        Expression::UnaryPlus(inner)
+        | Expression::UnaryMinus(inner)
+        | Expression::Not(inner) => {
+            expression_contains_highly_correlated_filter_exists(inner, input_types)
+        }
+        Expression::If(condition, then, els) => {
+            expression_contains_highly_correlated_filter_exists(condition, input_types)
+                || expression_contains_highly_correlated_filter_exists(then, input_types)
+                || expression_contains_highly_correlated_filter_exists(els, input_types)
+        }
+        Expression::FunctionCall(_, arguments) => arguments.iter().any(|argument| {
+            expression_contains_highly_correlated_filter_exists(argument, input_types)
+        }),
+        Expression::NamedNode(_)
+        | Expression::Literal(_)
+        | Expression::Variable(_)
+        | Expression::Bound(_) => false,
+    }
+}
+
 fn estimate_path_size(start_bound: bool, path: &PropertyPathExpression, end_bound: bool) -> usize {
     match path {
         PropertyPathExpression::NamedNode(_) => {
@@ -1702,11 +2515,19 @@ fn estimate_path_size(start_bound: bool, path: &PropertyPathExpression, end_boun
             if start_bound && end_bound {
                 1
             } else if start_bound || end_bound {
-                max(
+                if is_entry_bound_for_rdfs_subclass_of_kleene_transitive_path(
+                    path,
+                    start_bound,
+                    end_bound,
+                ) {
                     estimate_path_size(start_bound, p, end_bound)
-                        .saturating_mul(open_transitive_path_factor()),
-                    open_transitive_path_min_cost(),
-                )
+                } else {
+                    max(
+                        estimate_path_size(start_bound, p, end_bound)
+                            .saturating_mul(open_transitive_path_factor()),
+                        open_transitive_path_min_cost(),
+                    )
+                }
             } else {
                 open_transitive_path_full_scan_cost()
             }
@@ -1715,11 +2536,19 @@ fn estimate_path_size(start_bound: bool, path: &PropertyPathExpression, end_boun
             if start_bound && end_bound {
                 1
             } else if start_bound || end_bound {
-                max(
+                if is_entry_bound_for_rdfs_subclass_of_kleene_transitive_path(
+                    path,
+                    start_bound,
+                    end_bound,
+                ) {
                     estimate_path_size(start_bound, p, end_bound)
-                        .saturating_mul(open_transitive_path_factor()),
-                    open_transitive_path_min_cost(),
-                )
+                } else {
+                    max(
+                        estimate_path_size(start_bound, p, end_bound)
+                            .saturating_mul(open_transitive_path_factor()),
+                        open_transitive_path_min_cost(),
+                    )
+                }
             } else {
                 max(
                     estimate_path_size(start_bound, p, end_bound)
@@ -1808,7 +2637,7 @@ fn path_reordering_penalty(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxrdf::NamedNode;
+    use oxrdf::{Literal, NamedNode};
 
     fn transitive_subclass_path_star() -> PropertyPathExpression {
         PropertyPathExpression::ZeroOrMore(Box::new(PropertyPathExpression::NamedNode(
@@ -1822,11 +2651,20 @@ mod tests {
         )))
     }
 
-    #[test]
-    fn open_transitive_path_cost_is_strongly_penalized() {
-        let star = transitive_subclass_path_star();
-        let plus = transitive_subclass_path_plus();
+    fn reverse_transitive_subclass_path_plus() -> PropertyPathExpression {
+        PropertyPathExpression::OneOrMore(Box::new(PropertyPathExpression::Reverse(Box::new(
+            PropertyPathExpression::NamedNode(NamedNode::new_unchecked(RDFS_SUBCLASS_OF_IRI)),
+        ))))
+    }
 
+    #[test]
+    fn generic_open_transitive_path_cost_is_strongly_penalized() {
+        let star = PropertyPathExpression::ZeroOrMore(Box::new(PropertyPathExpression::NamedNode(
+            NamedNode::new_unchecked("http://example.com/p"),
+        )));
+        let plus = PropertyPathExpression::OneOrMore(Box::new(PropertyPathExpression::NamedNode(
+            NamedNode::new_unchecked("http://example.com/p"),
+        )));
         let baseline_selective_triple = estimate_triple_pattern_size(false, true, true);
         assert!(
             estimate_path_size(true, &star, false) > baseline_selective_triple,
@@ -1835,6 +2673,42 @@ mod tests {
         assert!(
             estimate_path_size(false, &plus, true) > baseline_selective_triple,
             "p+ with one bound endpoint should be costlier than a selective triple pattern"
+        );
+    }
+
+    #[test]
+    fn anchored_subclass_transitive_path_cost_stays_near_selective_triple() {
+        let star = transitive_subclass_path_star();
+        let plus = transitive_subclass_path_plus();
+        let anchored_subclass_triple = estimate_triple_pattern_size(true, true, false);
+
+        assert_eq!(
+            estimate_path_size(true, &star, false),
+            anchored_subclass_triple
+        );
+        assert_eq!(
+            estimate_path_size(true, &plus, false),
+            anchored_subclass_triple
+        );
+        assert_eq!(
+            estimate_path_size(false, &reverse_transitive_subclass_path_plus(), true),
+            anchored_subclass_triple
+        );
+    }
+
+    #[test]
+    fn unanchored_direction_subclass_transitive_path_keeps_open_path_penalty() {
+        let star = transitive_subclass_path_star();
+        let plus = transitive_subclass_path_plus();
+        let baseline_selective_triple = estimate_triple_pattern_size(false, true, true);
+
+        assert!(
+            estimate_path_size(false, &star, true) > baseline_selective_triple,
+            "forward subclass traversal with only the end bound should keep the generic open-path penalty",
+        );
+        assert!(
+            estimate_path_size(false, &plus, true) > baseline_selective_triple,
+            "forward subclass traversal with only the end bound should keep the generic open-path penalty",
         );
     }
 
@@ -1850,7 +2724,9 @@ mod tests {
     fn bounded_transitive_path_can_use_for_loop_when_entry_is_small() {
         let transitive_path = GraphPattern::Path {
             subject: Variable::new_unchecked("s").into(),
-            path: transitive_subclass_path_plus(),
+            path: PropertyPathExpression::OneOrMore(Box::new(PropertyPathExpression::NamedNode(
+                NamedNode::new_unchecked("http://example.com/p"),
+            ))),
             object: Variable::new_unchecked("o").into(),
             graph_name: None,
         };
@@ -1875,6 +2751,223 @@ mod tests {
                 transitive_lateral_max_left_size().saturating_add(1),
             ),
             "bounded transitive path should not use for-loop join once left input grows too much",
+        );
+    }
+
+    #[test]
+    fn subclass_transitive_path_can_use_attack_id_sized_anchor() {
+        let transitive_path = GraphPattern::Path {
+            subject: Variable::new_unchecked("s").into(),
+            path: transitive_subclass_path_plus(),
+            object: Variable::new_unchecked("o").into(),
+            graph_name: None,
+        };
+        let entry_seed = GraphPattern::QuadPattern {
+            subject: Variable::new_unchecked("s").into(),
+            predicate: NamedNode::new_unchecked("http://example.com/attack-id").into(),
+            object: Literal::new_simple_literal("T1546").into(),
+            graph_name: None,
+        };
+        let global_types = VariableTypes::default();
+        let entry_types = infer_graph_pattern_types(&entry_seed, VariableTypes::default());
+        let entry_estimated_size = estimate_graph_pattern_size(&entry_seed, &global_types);
+
+        assert_eq!(
+            entry_estimated_size,
+            estimate_triple_pattern_size(false, true, true),
+            "attack-id style anchors should keep the object-bound triple estimate used by the planner",
+        );
+        assert!(
+            is_fit_for_for_loop_join(
+                &transitive_path,
+                &global_types,
+                &entry_types,
+                entry_estimated_size,
+            ),
+            "transitive rdfs:subClassOf paths should stay lateralizable for attack-id sized anchors",
+        );
+        assert!(
+            !is_fit_for_for_loop_join(
+                &transitive_path,
+                &global_types,
+                &entry_types,
+                subclass_transitive_lateral_max_left_size().saturating_add(1),
+            ),
+            "subclass transitive paths should still stop lateralizing above the dedicated threshold",
+        );
+    }
+
+    #[test]
+    fn generic_transitive_path_stays_blocked_for_attack_id_sized_anchor() {
+        let transitive_path = GraphPattern::Path {
+            subject: Variable::new_unchecked("s").into(),
+            path: PropertyPathExpression::OneOrMore(Box::new(PropertyPathExpression::NamedNode(
+                NamedNode::new_unchecked("http://example.com/p"),
+            ))),
+            object: Variable::new_unchecked("o").into(),
+            graph_name: None,
+        };
+        let entry_seed = GraphPattern::QuadPattern {
+            subject: Variable::new_unchecked("s").into(),
+            predicate: NamedNode::new_unchecked("http://example.com/attack-id").into(),
+            object: Literal::new_simple_literal("T1546").into(),
+            graph_name: None,
+        };
+        let entry_types = infer_graph_pattern_types(&entry_seed, VariableTypes::default());
+        let entry_estimated_size =
+            estimate_graph_pattern_size(&entry_seed, &VariableTypes::default());
+
+        assert!(
+            !is_fit_for_for_loop_join(
+                &transitive_path,
+                &VariableTypes::default(),
+                &entry_types,
+                entry_estimated_size,
+            ),
+            "the broader subclass threshold must not make arbitrary transitive predicates lateralizable",
+        );
+    }
+
+    #[test]
+    fn forward_subclass_transitive_path_stays_blocked_when_only_end_is_entry_bound() {
+        let transitive_path = GraphPattern::Path {
+            subject: Variable::new_unchecked("s").into(),
+            path: transitive_subclass_path_plus(),
+            object: Variable::new_unchecked("o").into(),
+            graph_name: None,
+        };
+        let entry_seed = GraphPattern::QuadPattern {
+            subject: Variable::new_unchecked("o").into(),
+            predicate: NamedNode::new_unchecked("http://example.com/attack-id").into(),
+            object: Literal::new_simple_literal("T1546").into(),
+            graph_name: None,
+        };
+        let entry_types = infer_graph_pattern_types(&entry_seed, VariableTypes::default());
+        let entry_estimated_size =
+            estimate_graph_pattern_size(&entry_seed, &VariableTypes::default());
+
+        assert!(
+            !is_fit_for_for_loop_join(
+                &transitive_path,
+                &VariableTypes::default(),
+                &entry_types,
+                entry_estimated_size,
+            ),
+            "forward rdfs:subClassOf traversal should not relax the threshold when only the path end is entry-bound",
+        );
+    }
+
+    #[test]
+    fn reverse_subclass_transitive_path_can_use_attack_id_sized_anchor() {
+        let transitive_path = GraphPattern::Path {
+            subject: Variable::new_unchecked("s").into(),
+            path: reverse_transitive_subclass_path_plus(),
+            object: Variable::new_unchecked("o").into(),
+            graph_name: None,
+        };
+        let entry_seed = GraphPattern::QuadPattern {
+            subject: Variable::new_unchecked("o").into(),
+            predicate: NamedNode::new_unchecked("http://example.com/attack-id").into(),
+            object: Literal::new_simple_literal("T1546").into(),
+            graph_name: None,
+        };
+        let global_types = VariableTypes::default();
+        let entry_types = infer_graph_pattern_types(&entry_seed, VariableTypes::default());
+        let entry_estimated_size = estimate_graph_pattern_size(&entry_seed, &global_types);
+
+        assert!(
+            is_fit_for_for_loop_join(
+                &transitive_path,
+                &global_types,
+                &entry_types,
+                entry_estimated_size,
+            ),
+            "reverse rdfs:subClassOf traversal should relax the threshold when the path end is entry-bound",
+        );
+    }
+
+    #[test]
+    fn reverse_subclass_transitive_path_stays_blocked_when_only_start_is_entry_bound() {
+        let transitive_path = GraphPattern::Path {
+            subject: Variable::new_unchecked("s").into(),
+            path: reverse_transitive_subclass_path_plus(),
+            object: Variable::new_unchecked("o").into(),
+            graph_name: None,
+        };
+        let entry_seed = GraphPattern::QuadPattern {
+            subject: Variable::new_unchecked("s").into(),
+            predicate: NamedNode::new_unchecked("http://example.com/attack-id").into(),
+            object: Literal::new_simple_literal("T1546").into(),
+            graph_name: None,
+        };
+        let entry_types = infer_graph_pattern_types(&entry_seed, VariableTypes::default());
+        let entry_estimated_size =
+            estimate_graph_pattern_size(&entry_seed, &VariableTypes::default());
+
+        assert!(
+            !is_fit_for_for_loop_join(
+                &transitive_path,
+                &VariableTypes::default(),
+                &entry_types,
+                entry_estimated_size,
+            ),
+            "reverse rdfs:subClassOf traversal should not relax the threshold when only the path start is entry-bound",
+        );
+    }
+
+    #[test]
+    fn join_branch_can_use_for_loop_when_entry_and_internal_factors_bind_in_sequence() {
+        let off_tech = Variable::new_unchecked("off_tech");
+        let top_level = Variable::new_unchecked("_off_top_level");
+        let parent = Variable::new_unchecked("parent");
+        let branch = GraphPattern::join(
+            GraphPattern::join(
+                GraphPattern::QuadPattern {
+                    subject: parent.clone().into(),
+                    predicate: NamedNode::new_unchecked("http://example.com/rel").into(),
+                    object: Variable::new_unchecked("off_artifact").into(),
+                    graph_name: None,
+                },
+                GraphPattern::Path {
+                    subject: parent.clone().into(),
+                    path: transitive_subclass_path_plus(),
+                    object: top_level.clone().into(),
+                    graph_name: None,
+                },
+                JoinAlgorithm::HashBuildLeftProbeRight {
+                    keys: vec![parent.clone()],
+                },
+            ),
+            GraphPattern::Path {
+                subject: off_tech.clone().into(),
+                path: transitive_subclass_path_plus(),
+                object: parent.into(),
+                graph_name: None,
+            },
+            JoinAlgorithm::HashBuildLeftProbeRight {
+                keys: vec![Variable::new_unchecked("parent")],
+            },
+        );
+        let entry_seed = GraphPattern::extend(
+            GraphPattern::extend(
+                GraphPattern::empty_singleton(),
+                off_tech,
+                NamedNode::new_unchecked("http://example.com/off-tech").into(),
+            ),
+            top_level,
+            NamedNode::new_unchecked("http://example.com/top-level").into(),
+        );
+        let global_types = VariableTypes::default();
+        let entry_types = infer_graph_pattern_types(&entry_seed, global_types.clone());
+
+        assert!(
+            is_fit_for_for_loop_join(
+                &branch,
+                &global_types,
+                &entry_types,
+                estimate_graph_pattern_size(&entry_seed, &global_types),
+            ),
+            "join branches should be lateralizable when entry bindings plus earlier factors can bind each transitive path in sequence",
         );
     }
 
@@ -1991,6 +3084,347 @@ mod tests {
             ),
             "the size guard should target rdfs:subClassOf quads only",
         );
+    }
+
+    #[cfg(feature = "sep-0006")]
+    #[test]
+    fn optimizer_lateralizes_attack_id_anchored_subclass_path() {
+        let off_tech = Variable::new_unchecked("off_tech");
+        let framework_root = Variable::new_unchecked("framework_root_iri");
+        let attack_id_quad = GraphPattern::QuadPattern {
+            subject: off_tech.clone().into(),
+            predicate: NamedNode::new_unchecked("http://example.com/attack-id").into(),
+            object: Literal::new_simple_literal("T1546").into(),
+            graph_name: None,
+        };
+        let path = GraphPattern::Path {
+            subject: off_tech.clone().into(),
+            path: transitive_subclass_path_star(),
+            object: framework_root.into(),
+            graph_name: None,
+        };
+        let pattern = GraphPattern::join(
+            attack_id_quad.clone(),
+            path.clone(),
+            JoinAlgorithm::HashBuildLeftProbeRight {
+                keys: vec![off_tech.clone()],
+            },
+        );
+
+        let optimized = Optimizer::optimize_graph_pattern(pattern);
+        match optimized {
+            GraphPattern::Lateral { left, right } => {
+                assert_eq!(*left, attack_id_quad);
+                assert_eq!(*right, path);
+            }
+            other => panic!(
+                "optimizer should lateralize attack-id anchored subclass transitive paths, got {other:?}"
+            ),
+        }
+    }
+
+    #[cfg(feature = "sep-0006")]
+    fn has_lateral_subtree(
+        pattern: &GraphPattern,
+        expected_left: &GraphPattern,
+        expected_right: &GraphPattern,
+    ) -> bool {
+        match pattern {
+            GraphPattern::Lateral { left, right } => {
+                (left.as_ref() == expected_left && right.as_ref() == expected_right)
+                    || has_lateral_subtree(left, expected_left, expected_right)
+                    || has_lateral_subtree(right, expected_left, expected_right)
+            }
+            GraphPattern::Join { left, right, .. }
+            | GraphPattern::LeftJoin { left, right, .. }
+            | GraphPattern::Minus { left, right, .. } => {
+                has_lateral_subtree(left, expected_left, expected_right)
+                    || has_lateral_subtree(right, expected_left, expected_right)
+            }
+            GraphPattern::Filter { inner, .. }
+            | GraphPattern::Extend { inner, .. }
+            | GraphPattern::OrderBy { inner, .. }
+            | GraphPattern::Project { inner, .. }
+            | GraphPattern::Distinct { inner, .. }
+            | GraphPattern::Reduced { inner, .. }
+            | GraphPattern::Slice { inner, .. }
+            | GraphPattern::Group { inner, .. }
+            | GraphPattern::Service { inner, .. } => {
+                has_lateral_subtree(inner, expected_left, expected_right)
+            }
+            GraphPattern::Union { inner } => inner
+                .iter()
+                .any(|branch| has_lateral_subtree(branch, expected_left, expected_right)),
+            GraphPattern::Values { .. }
+            | GraphPattern::QuadPattern { .. }
+            | GraphPattern::Path { .. }
+            | GraphPattern::Graph { .. } => false,
+        }
+    }
+
+    #[cfg(feature = "sep-0006")]
+    fn has_lateral_with_union_right(pattern: &GraphPattern) -> bool {
+        match pattern {
+            GraphPattern::Lateral { left, right } => {
+                matches!(right.as_ref(), GraphPattern::Union { .. })
+                    || has_lateral_with_union_right(left)
+                    || has_lateral_with_union_right(right)
+            }
+            GraphPattern::Join { left, right, .. }
+            | GraphPattern::LeftJoin { left, right, .. }
+            | GraphPattern::Minus { left, right, .. } => {
+                has_lateral_with_union_right(left) || has_lateral_with_union_right(right)
+            }
+            GraphPattern::Filter { inner, .. }
+            | GraphPattern::Extend { inner, .. }
+            | GraphPattern::OrderBy { inner, .. }
+            | GraphPattern::Project { inner, .. }
+            | GraphPattern::Distinct { inner, .. }
+            | GraphPattern::Reduced { inner, .. }
+            | GraphPattern::Slice { inner, .. }
+            | GraphPattern::Group { inner, .. }
+            | GraphPattern::Service { inner, .. } => has_lateral_with_union_right(inner),
+            GraphPattern::Union { inner } => inner.iter().any(has_lateral_with_union_right),
+            GraphPattern::Values { .. }
+            | GraphPattern::QuadPattern { .. }
+            | GraphPattern::Path { .. }
+            | GraphPattern::Graph { .. } => false,
+        }
+    }
+
+    #[cfg(feature = "sep-0006")]
+    #[test]
+    fn optimizer_keeps_attack_id_anchored_subclass_path_lateral_under_framework_root_join() {
+        let off_tech = Variable::new_unchecked("off_tech");
+        let framework_root = Variable::new_unchecked("framework_root_iri");
+        let framework_root_key = framework_root.clone();
+        let off_top_level = Variable::new_unchecked("off_top_level");
+        let attack_id_quad = GraphPattern::QuadPattern {
+            subject: off_tech.clone().into(),
+            predicate: NamedNode::new_unchecked("http://example.com/attack-id").into(),
+            object: Literal::new_simple_literal("T1546").into(),
+            graph_name: None,
+        };
+        let path = GraphPattern::Path {
+            subject: off_tech.clone().into(),
+            path: transitive_subclass_path_star(),
+            object: framework_root.clone().into(),
+            graph_name: None,
+        };
+        let framework_root_child = GraphPattern::QuadPattern {
+            subject: off_top_level.into(),
+            predicate: NamedNode::new_unchecked(RDFS_SUBCLASS_OF_IRI).into(),
+            object: framework_root.into(),
+            graph_name: None,
+        };
+        let pattern = GraphPattern::join(
+            GraphPattern::join(
+                attack_id_quad.clone(),
+                path.clone(),
+                JoinAlgorithm::HashBuildLeftProbeRight {
+                    keys: vec![off_tech.clone()],
+                },
+            ),
+            framework_root_child,
+            JoinAlgorithm::HashBuildLeftProbeRight {
+                keys: vec![framework_root_key],
+            },
+        );
+
+        let optimized = Optimizer::optimize_graph_pattern(pattern);
+        assert!(
+            has_lateral_subtree(&optimized, &attack_id_quad, &path),
+            "optimizer should keep the attack-id anchor correlated with the subclass path even when another join consumes framework_root_iri, got {optimized:?}",
+        );
+    }
+
+    #[cfg(feature = "sep-0006")]
+    #[test]
+    fn optimizer_lateralizes_union_of_join_branches_for_small_anchor() {
+        let off_tech = Variable::new_unchecked("off_tech");
+        let top_level = Variable::new_unchecked("_off_top_level");
+        let parent = Variable::new_unchecked("parent");
+        let child = Variable::new_unchecked("child");
+        let anchor = GraphPattern::extend(
+            GraphPattern::extend(
+                GraphPattern::empty_singleton(),
+                off_tech.clone(),
+                NamedNode::new_unchecked("http://example.com/off-tech").into(),
+            ),
+            top_level.clone(),
+            NamedNode::new_unchecked("http://example.com/top-level").into(),
+        );
+        let branch_a = GraphPattern::join(
+            GraphPattern::join(
+                GraphPattern::QuadPattern {
+                    subject: parent.clone().into(),
+                    predicate: Variable::new_unchecked("off_artifact_rel").into(),
+                    object: Variable::new_unchecked("off_artifact").into(),
+                    graph_name: None,
+                },
+                GraphPattern::Path {
+                    subject: parent.clone().into(),
+                    path: transitive_subclass_path_plus(),
+                    object: top_level.into(),
+                    graph_name: None,
+                },
+                JoinAlgorithm::HashBuildLeftProbeRight {
+                    keys: vec![parent.clone()],
+                },
+            ),
+            GraphPattern::Path {
+                subject: off_tech.clone().into(),
+                path: transitive_subclass_path_plus(),
+                object: parent.into(),
+                graph_name: None,
+            },
+            JoinAlgorithm::HashBuildLeftProbeRight {
+                keys: vec![Variable::new_unchecked("parent")],
+            },
+        );
+        let branch_b = GraphPattern::join(
+            GraphPattern::QuadPattern {
+                subject: child.clone().into(),
+                predicate: Variable::new_unchecked("off_artifact_rel").into(),
+                object: Variable::new_unchecked("off_artifact").into(),
+                graph_name: None,
+            },
+            GraphPattern::Path {
+                subject: child.into(),
+                path: transitive_subclass_path_plus(),
+                object: off_tech.clone().into(),
+                graph_name: None,
+            },
+            JoinAlgorithm::HashBuildLeftProbeRight {
+                keys: vec![Variable::new_unchecked("child")],
+            },
+        );
+        let pattern = GraphPattern::join(
+            anchor,
+            GraphPattern::union_all([branch_a, branch_b]),
+            JoinAlgorithm::HashBuildLeftProbeRight {
+                keys: vec![off_tech],
+            },
+        );
+
+        let optimized = Optimizer::optimize_graph_pattern(pattern);
+        assert!(
+            has_lateral_with_union_right(&optimized),
+            "small anchors should lateralize unions of join branches so the union runs per entry binding, got {optimized:?}",
+        );
+    }
+
+    #[cfg(feature = "sep-0006")]
+    fn attack_id_anchored_subclass_lateral_shared_factor() -> GraphPattern {
+        let off_tech = Variable::new_unchecked("s");
+        let off_tech_id = Variable::new_unchecked("off_tech_id");
+        let framework_root = Variable::new_unchecked("framework_root_iri");
+        GraphPattern::lateral(
+            GraphPattern::lateral(
+                GraphPattern::extend(
+                    GraphPattern::empty_singleton(),
+                    off_tech_id.clone(),
+                    Literal::new_simple_literal("T1546").into(),
+                ),
+                GraphPattern::QuadPattern {
+                    subject: off_tech.clone().into(),
+                    predicate: NamedNode::new_unchecked("http://example.com/attack-id").into(),
+                    object: off_tech_id.into(),
+                    graph_name: None,
+                },
+            ),
+            GraphPattern::Path {
+                subject: off_tech.into(),
+                path: transitive_subclass_path_star(),
+                object: framework_root.into(),
+                graph_name: None,
+            },
+        )
+    }
+
+    #[cfg(feature = "sep-0006")]
+    fn singleton_anchored_subclass_lateral_factor() -> GraphPattern {
+        let off_tech = Variable::new_unchecked("s");
+        let framework_root = Variable::new_unchecked("framework_root_iri");
+        GraphPattern::lateral(
+            GraphPattern::extend(
+                GraphPattern::empty_singleton(),
+                off_tech.clone(),
+                NamedNode::new_unchecked("http://example.com/seed").into(),
+            ),
+            GraphPattern::Path {
+                subject: off_tech.into(),
+                path: transitive_subclass_path_star(),
+                object: framework_root.into(),
+                graph_name: None,
+            },
+        )
+    }
+
+    #[cfg(feature = "sep-0006")]
+    fn expensive_cartesian_subclass_path() -> GraphPattern {
+        GraphPattern::Path {
+            subject: Variable::new_unchecked("wide_left").into(),
+            path: transitive_subclass_path_star(),
+            object: Variable::new_unchecked("wide_right").into(),
+            graph_name: None,
+        }
+    }
+
+    #[cfg(feature = "sep-0006")]
+    fn expensive_relaxed_subclass_lateral_shared_factor() -> GraphPattern {
+        GraphPattern::join(
+            attack_id_anchored_subclass_lateral_shared_factor(),
+            expensive_cartesian_subclass_path(),
+            JoinAlgorithm::HashBuildLeftProbeRight { keys: Vec::new() },
+        )
+    }
+
+    #[cfg(feature = "sep-0006")]
+    fn expensive_singleton_subclass_lateral_shared_factor() -> GraphPattern {
+        GraphPattern::join(
+            singleton_anchored_subclass_lateral_factor(),
+            expensive_cartesian_subclass_path(),
+            JoinAlgorithm::HashBuildLeftProbeRight { keys: Vec::new() },
+        )
+    }
+
+    #[cfg(feature = "sep-0006")]
+    fn raw_attack_id_anchored_subclass_shared_factor() -> GraphPattern {
+        let off_tech = Variable::new_unchecked("s");
+        let off_tech_id = Variable::new_unchecked("off_tech_id");
+        let framework_root = Variable::new_unchecked("framework_root_iri");
+        GraphPattern::join(
+            GraphPattern::join(
+                GraphPattern::extend(
+                    GraphPattern::empty_singleton(),
+                    off_tech_id.clone(),
+                    Literal::new_simple_literal("T1546").into(),
+                ),
+                GraphPattern::QuadPattern {
+                    subject: off_tech.clone().into(),
+                    predicate: NamedNode::new_unchecked("http://example.com/attack-id").into(),
+                    object: off_tech_id.into(),
+                    graph_name: None,
+                },
+                JoinAlgorithm::HashBuildLeftProbeRight {
+                    keys: vec![Variable::new_unchecked("off_tech_id")],
+                },
+            ),
+            GraphPattern::join(
+                GraphPattern::Path {
+                    subject: off_tech.into(),
+                    path: transitive_subclass_path_star(),
+                    object: framework_root.into(),
+                    graph_name: None,
+                },
+                expensive_cartesian_subclass_path(),
+                JoinAlgorithm::HashBuildLeftProbeRight { keys: Vec::new() },
+            ),
+            JoinAlgorithm::HashBuildLeftProbeRight {
+                keys: vec![Variable::new_unchecked("s")],
+            },
+        )
     }
 
     fn has_singleton_union_left_join(pattern: &GraphPattern) -> bool {
@@ -2194,6 +3628,182 @@ mod tests {
         assert!(
             !has_singleton_union_left_join(&optimized),
             "optimized plan should not keep a singleton-union left join shape"
+        );
+    }
+
+    #[cfg(feature = "sep-0006")]
+    #[test]
+    fn lateralized_subclass_inner_join_singleton_union_branch_is_not_duplicated() {
+        let shared = expensive_relaxed_subclass_lateral_shared_factor();
+        let anchored_factor = attack_id_anchored_subclass_lateral_shared_factor();
+        let extra = GraphPattern::QuadPattern {
+            subject: Variable::new_unchecked("s").into(),
+            predicate: NamedNode::new_unchecked("http://example.com/q").into(),
+            object: Variable::new_unchecked("x").into(),
+            graph_name: None,
+        };
+        assert!(
+            should_avoid_singleton_union_duplication(&shared, &VariableTypes::default()),
+            "test precondition: the shared factor should be expensive enough to skip singleton-union duplication",
+        );
+        let pattern = GraphPattern::join(
+            shared.clone(),
+            GraphPattern::union_all([GraphPattern::empty_singleton(), extra]),
+            JoinAlgorithm::HashBuildLeftProbeRight {
+                keys: vec![Variable::new_unchecked("s")],
+            },
+        );
+
+        let optimized = Optimizer::optimize_graph_pattern(pattern);
+        assert_eq!(
+            count_occurrences(&optimized, &anchored_factor),
+            1,
+            "lateralized anchored subclass factors should not be duplicated across singleton-union inner joins",
+        );
+    }
+
+    #[cfg(feature = "sep-0006")]
+    #[test]
+    fn lateralized_subclass_left_join_singleton_union_branch_is_not_duplicated() {
+        let shared = expensive_relaxed_subclass_lateral_shared_factor();
+        let anchored_factor = attack_id_anchored_subclass_lateral_shared_factor();
+        let extra = GraphPattern::QuadPattern {
+            subject: Variable::new_unchecked("s").into(),
+            predicate: NamedNode::new_unchecked("http://example.com/q").into(),
+            object: Variable::new_unchecked("x").into(),
+            graph_name: None,
+        };
+        assert!(
+            should_avoid_singleton_union_duplication(&shared, &VariableTypes::default()),
+            "test precondition: the shared factor should be expensive enough to skip singleton-union duplication",
+        );
+        let pattern = GraphPattern::left_join(
+            shared.clone(),
+            GraphPattern::union_all([GraphPattern::empty_singleton(), extra]),
+            true.into(),
+            LeftJoinAlgorithm::HashBuildRightProbeLeft {
+                keys: vec![Variable::new_unchecked("s")],
+            },
+        );
+
+        let optimized = Optimizer::optimize_graph_pattern(pattern);
+        assert_eq!(
+            count_occurrences(&optimized, &anchored_factor),
+            1,
+            "lateralized anchored subclass factors should not be duplicated across singleton-union left joins",
+        );
+    }
+
+    #[cfg(feature = "sep-0006")]
+    #[test]
+    fn flat_singleton_union_rewrite_preserves_non_singleton_branches() {
+        let shared = expensive_relaxed_subclass_lateral_shared_factor();
+        let anchored_factor = attack_id_anchored_subclass_lateral_shared_factor();
+        let base = GraphPattern::QuadPattern {
+            subject: Variable::new_unchecked("s").into(),
+            predicate: NamedNode::new_unchecked("http://example.com/p").into(),
+            object: Variable::new_unchecked("label").into(),
+            graph_name: None,
+        };
+        let extra = GraphPattern::QuadPattern {
+            subject: Variable::new_unchecked("s").into(),
+            predicate: NamedNode::new_unchecked("http://example.com/q").into(),
+            object: Variable::new_unchecked("x").into(),
+            graph_name: None,
+        };
+        let pattern = GraphPattern::join(
+            GraphPattern::join(
+                shared,
+                base.clone(),
+                JoinAlgorithm::HashBuildLeftProbeRight {
+                    keys: vec![Variable::new_unchecked("s")],
+                },
+            ),
+            GraphPattern::union_all([GraphPattern::empty_singleton(), extra.clone()]),
+            JoinAlgorithm::HashBuildLeftProbeRight {
+                keys: vec![Variable::new_unchecked("s")],
+            },
+        );
+
+        let optimized = Optimizer::optimize_graph_pattern(pattern);
+        assert_eq!(
+            count_occurrences(&optimized, &anchored_factor),
+            1,
+            "the guarded anchored subclass factor should stay shared outside the rewritten singleton-UNION branch",
+        );
+        assert!(
+            count_occurrences(&optimized, &extra) >= 1,
+            "flattened singleton-union rewrites must preserve the non-singleton UNION branch",
+        );
+    }
+
+    #[cfg(feature = "sep-0006")]
+    #[test]
+    fn singleton_anchor_subclass_branch_is_still_duplicated_by_singleton_union_rewrite() {
+        let shared = expensive_singleton_subclass_lateral_shared_factor();
+        let anchored_factor = singleton_anchored_subclass_lateral_factor();
+        let extra = GraphPattern::QuadPattern {
+            subject: Variable::new_unchecked("s").into(),
+            predicate: NamedNode::new_unchecked("http://example.com/q").into(),
+            object: Variable::new_unchecked("x").into(),
+            graph_name: None,
+        };
+        assert!(
+            !should_avoid_singleton_union_duplication(&shared, &VariableTypes::default()),
+            "test precondition: singleton-anchored subclass laterals should not block singleton-union duplication",
+        );
+        let pattern = GraphPattern::join(
+            shared,
+            GraphPattern::union_all([GraphPattern::empty_singleton(), extra.clone()]),
+            JoinAlgorithm::HashBuildLeftProbeRight {
+                keys: vec![Variable::new_unchecked("s")],
+            },
+        );
+
+        let optimized = Optimizer::optimize_graph_pattern(pattern);
+        assert!(
+            matches!(optimized, GraphPattern::Union { .. }),
+            "singleton-UNION rewrite should still fire when the subclass lateral only depends on a true singleton anchor",
+        );
+        assert!(
+            count_occurrences(&optimized, &anchored_factor) >= 2,
+            "large branches with only singleton-anchored subclass laterals should still be duplicable",
+        );
+    }
+
+    #[cfg(feature = "sep-0006")]
+    #[test]
+    fn raw_attack_id_subclass_branch_is_not_duplicated_by_singleton_union_rewrite() {
+        let shared = raw_attack_id_anchored_subclass_shared_factor();
+        let anchored_factor = attack_id_anchored_subclass_lateral_shared_factor();
+        let extra = GraphPattern::QuadPattern {
+            subject: Variable::new_unchecked("s").into(),
+            predicate: NamedNode::new_unchecked("http://example.com/q").into(),
+            object: Variable::new_unchecked("x").into(),
+            graph_name: None,
+        };
+        let reordered_shared = Optimizer::reorder_joins(shared.clone(), &VariableTypes::default());
+        assert!(
+            should_avoid_singleton_union_duplication(&reordered_shared, &VariableTypes::default()),
+            "test precondition: the preview-reordered shared factor should expose the relaxed subclass lateral",
+        );
+        let pattern = GraphPattern::join(
+            shared,
+            GraphPattern::union_all([GraphPattern::empty_singleton(), extra.clone()]),
+            JoinAlgorithm::HashBuildLeftProbeRight {
+                keys: vec![Variable::new_unchecked("s")],
+            },
+        );
+
+        let optimized = Optimizer::optimize_graph_pattern(pattern);
+        assert_eq!(
+            count_occurrences(&optimized, &anchored_factor),
+            1,
+            "singleton-union rewrites should not duplicate raw branches that preview into the anchored subclass lateral shape",
+        );
+        assert!(
+            count_occurrences(&optimized, &extra) >= 1,
+            "singleton-union rewrites must preserve the non-singleton UNION branch for raw anchored subclasses too",
         );
     }
 
