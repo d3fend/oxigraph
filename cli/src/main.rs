@@ -751,12 +751,14 @@ fn serve(
     union_default_graph: bool,
     timeout_s: Option<u64>,
 ) -> anyhow::Result<()> {
+    let sparql_evaluator = default_sparql_evaluator();
     let timeout = timeout_s.map(Duration::from_secs);
     let mut server = if cors {
         Server::new(cors_middleware(move |request| {
             handle_request(
                 request,
                 store.clone(),
+                sparql_evaluator.clone(),
                 read_only,
                 union_default_graph,
                 timeout,
@@ -768,6 +770,7 @@ fn serve(
             handle_request(
                 request,
                 store.clone(),
+                sparql_evaluator.clone(),
                 read_only,
                 union_default_graph,
                 timeout,
@@ -826,6 +829,7 @@ type HttpError = (StatusCode, String);
 fn handle_request(
     request: &mut Request<Body>,
     store: Store,
+    sparql_evaluator: SparqlEvaluator,
     read_only: bool,
     union_default_graph: bool,
     timeout: Option<Duration>,
@@ -880,6 +884,7 @@ fn handle_request(
             } else {
                 configure_and_evaluate_sparql_query(
                     &store,
+                    sparql_evaluator,
                     &[url_query(request)],
                     None,
                     request,
@@ -895,6 +900,7 @@ fn handle_request(
                 let query = limited_string_body(request)?;
                 configure_and_evaluate_sparql_query(
                     &store,
+                    sparql_evaluator,
                     &[url_query(request)],
                     Some(query),
                     request,
@@ -905,6 +911,7 @@ fn handle_request(
                 let buffer = limited_body(request)?;
                 configure_and_evaluate_sparql_query(
                     &store,
+                    sparql_evaluator,
                     &[url_query(request), &buffer],
                     None,
                     request,
@@ -1159,7 +1166,7 @@ fn base_url(request: &Request<Body>) -> String {
             if path_and_query.query().is_some() {
                 *path_and_query = PathAndQuery::try_from(path_and_query.path()).unwrap();
             }
-        };
+        }
         Uri::from_parts(parts).unwrap().to_string()
     } else {
         uri.to_string()
@@ -1226,6 +1233,7 @@ fn limited_body(request: &mut Request<Body>) -> Result<Vec<u8>, HttpError> {
 
 fn configure_and_evaluate_sparql_query(
     store: &Store,
+    evaluator: SparqlEvaluator,
     encoded: &[&[u8]],
     mut query: Option<String>,
     request: &Request<Body>,
@@ -1257,6 +1265,7 @@ fn configure_and_evaluate_sparql_query(
     let query = query.ok_or_else(|| bad_request("You should set the 'query' parameter"))?;
     evaluate_sparql_query(
         store,
+        evaluator,
         &query,
         use_default_graph_as_union,
         default_graph_uris,
@@ -1268,6 +1277,7 @@ fn configure_and_evaluate_sparql_query(
 
 fn evaluate_sparql_query(
     store: &Store,
+    evaluator: SparqlEvaluator,
     query: &str,
     use_default_graph_as_union: bool,
     default_graph_uris: Vec<String>,
@@ -1275,7 +1285,7 @@ fn evaluate_sparql_query(
     request: &Request<Body>,
     timeout: Option<Duration>,
 ) -> Result<Response<Body>, HttpError> {
-    let mut evaluator = default_sparql_evaluator()
+    let mut evaluator = evaluator
         .with_base_iri(base_url(request))
         .map_err(bad_request)?;
 
@@ -3173,6 +3183,7 @@ mod tests {
             handle_request(
                 &mut request.map(Into::into),
                 self.store.clone(),
+                default_sparql_evaluator(),
                 false,
                 false,
                 None,
@@ -3184,6 +3195,7 @@ mod tests {
             handle_request(
                 &mut request.map(Into::into),
                 self.store.clone(),
+                default_sparql_evaluator(),
                 true,
                 false,
                 None,
