@@ -775,16 +775,16 @@ pub fn build_expression_evaluator<'a, C: ExpressionEvaluatorContext<'a>>(
                 if let Some(regex) =
                     compile_static_pattern_if_exists(&parameters[1], parameters.get(3))
                 {
+                    let literal_replacement = parameters.get(3).is_some_and(|flags| {
+                        matches!(flags, Expression::Literal(flags) if flags.value().contains('q'))
+                    });
                     Rc::new(move |tuple| {
                         let (text, language) = to_string_and_language(arg(tuple)?)?;
                         let ExpressionTerm::StringLiteral(replacement) = replacement(tuple)? else {
                             return None;
                         };
                         Some(build_plain_literal(
-                            match regex.replace_all(&text, &replacement) {
-                                Cow::Owned(replaced) => replaced,
-                                Cow::Borrowed(_) => text,
-                            },
+                            replace_xpath(&regex, text, &replacement, literal_replacement)?,
                             language,
                         ))
                     })
@@ -812,10 +812,12 @@ pub fn build_expression_evaluator<'a, C: ExpressionEvaluatorContext<'a>>(
                             return None;
                         };
                         Some(build_plain_literal(
-                            match regex.replace_all(&text, &replacement) {
-                                Cow::Owned(replaced) => replaced,
-                                Cow::Borrowed(_) => text,
-                            },
+                            replace_xpath(
+                                &regex,
+                                text,
+                                &replacement,
+                                options.as_deref().is_some_and(|flags| flags.contains('q')),
+                            )?,
                             language,
                         ))
                     })
@@ -1777,30 +1779,115 @@ fn compile_static_pattern_if_exists(
 fn compile_pattern(pattern: &str, flags: Option<&str>) -> Option<Regex> {
     let mut pattern = Cow::Borrowed(pattern);
     let flags = flags.unwrap_or_default();
-    if flags.contains('q') {
+    let quoted = flags.contains('q');
+    if quoted {
         pattern = regex::escape(&pattern).into();
     }
     let mut regex_builder = RegexBuilder::new(&pattern);
     regex_builder.size_limit(REGEX_SIZE_LIMIT);
     for flag in flags.chars() {
         match flag {
-            's' => {
+            's' if !quoted => {
                 regex_builder.dot_matches_new_line(true);
             }
-            'm' => {
+            'm' if !quoted => {
                 regex_builder.multi_line(true);
             }
             'i' => {
                 regex_builder.case_insensitive(true);
             }
-            'x' => {
+            'x' if !quoted => {
                 regex_builder.ignore_whitespace(true);
             }
-            'q' => (),        // Already supported
-            _ => return None, // invalid option
+            'q' | 's' | 'm' | 'x' => (), // q disables the m, s, and x flags.
+            _ => return None,            // invalid option
         }
     }
     regex_builder.build().ok()
+}
+
+/// XPath 3.1 fn:replace uses a different replacement language from Rust regex.
+/// The pattern compiler's current XPath syntax limitations are unchanged.
+fn replace_xpath(
+    regex: &Regex,
+    text: String,
+    replacement: &str,
+    literal_replacement: bool,
+) -> Option<String> {
+    // FORX0003 applies even when the input contains no match.
+    if regex.is_match("") {
+        return None;
+    }
+    let replaced = if literal_replacement {
+        regex.replace_all(&text, regex::NoExpand(replacement))
+    } else {
+        // Validate once, before matching: malformed replacements are errors
+        // even when no substring of the input matches the pattern.
+        let template = xpath_replacement_template(replacement, regex.captures_len() - 1)?;
+        // The returned Cow borrows only text, never the replacement template.
+        regex.replace_all(&text, template.as_str())
+    };
+    Some(match replaced {
+        Cow::Owned(replaced) => replaced,
+        Cow::Borrowed(_) => text,
+    })
+}
+
+fn xpath_replacement_template(replacement: &str, captures: usize) -> Option<String> {
+    let mut template = String::with_capacity(replacement.len());
+    let bytes = replacement.as_bytes();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match bytes[offset] {
+            b'\\' => {
+                match bytes.get(offset + 1)? {
+                    b'\\' => template.push('\\'),
+                    b'$' => template.push_str("$$"),
+                    _ => return None, // FORX0004
+                }
+                offset += 2;
+            }
+            b'$' => {
+                offset += 1;
+                if !bytes.get(offset)?.is_ascii_digit() {
+                    return None; // FORX0004
+                }
+                // XPath strips trailing digits until N names a capture or
+                // is a single-digit number. Missing captures expand to empty.
+                // Read only the bounded numeric prefix; arbitrary-length
+                // digit suffixes and leading zeroes cannot overflow usize.
+                let mut capture = 0usize;
+                while let Some(digit) = bytes.get(offset).filter(|b| b.is_ascii_digit()) {
+                    let Some(next) = capture
+                        .checked_mul(10)
+                        .and_then(|value| value.checked_add(usize::from(*digit - b'0')))
+                        .filter(|value| *value <= captures.max(9))
+                    else {
+                        break;
+                    };
+                    capture = next;
+                    offset += 1;
+                }
+                template.push_str("${");
+                template.push_str(&capture.to_string());
+                template.push('}');
+                // Remaining digits are literal, not part of Rust's capture.
+                while let Some(digit) = bytes.get(offset).filter(|b| b.is_ascii_digit()) {
+                    template.push(char::from(*digit));
+                    offset += 1;
+                }
+            }
+            _ => {
+                let start = offset;
+                while offset < bytes.len() && !matches!(bytes[offset], b'\\' | b'$') {
+                    offset += 1;
+                }
+                // Both boundaries are ASCII delimiters or string boundaries.
+                template.push_str(&replacement[start..offset]);
+            }
+        }
+    }
+    Some(template)
 }
 
 /// Equality operator (=)
@@ -2384,6 +2471,66 @@ fn write_hexa_bytes(bytes: &[u8], buffer: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xpath_replace_replacement_language_and_errors() {
+        for (text, pattern, replacement, flags, expected) in [
+            ("abc", "b", "d", "", Some("adc")),
+            ("abc", "b", "", "", Some("ac")),
+            ("abc", "a*", "X", "", None),
+            ("abc", "", "X", "q", None),
+            ("nomatch", "b", "$", "", None),
+            ("nomatch", "b", "\\q", "", None),
+            ("abc", "b", "\\", "", None),
+            ("abc", "b", "$x", "", None),
+            ("abc", "b", "\\$", "", Some("a$c")),
+            ("abc", "b", "\\\\", "", Some("a\\c")),
+            ("ab", "(a)(b)", "$23:$1:$0", "", Some("b3:a:ab")),
+            ("a", "(a)", "\\$$1", "", Some("$a")),
+            ("ab", "(?:a)(b)", "$1:$2", "", Some("b:")),
+            ("b", "(a)?b", "[$1][$0]", "", Some("[][b]")),
+            ("a", "(a)", "$010|$099|$000|$2", "", Some("a0|9|a|")),
+            (
+                "abcdefghij",
+                "(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)",
+                "$10|$11|$19|$99",
+                "",
+                Some("j|a1|a9|i9"),
+            ),
+            (
+                "a",
+                "(a)",
+                "$000000000000000000000000000000000000000000000000001",
+                "",
+                Some("a"),
+            ),
+            ("abc", "b", "$0", "q", Some("a$0c")),
+            ("abc", "b", "\\$", "q", Some("a\\$c")),
+            ("a b", " ", "_", "qx", Some("a_b")),
+            ("a", " ", "_", "qx", Some("a")),
+            ("a\u{2003}b", "\u{2003}", "_", "qx", Some("a_b")),
+            ("A", "a", "$0", "qixmsq", Some("$0")),
+            ("é猫é", "(é)", "🐈$1", "", Some("🐈é猫🐈é")),
+        ] {
+            let regex = compile_pattern(pattern, Some(flags)).unwrap();
+            assert_eq!(
+                replace_xpath(&regex, text.into(), replacement, flags.contains('q')).as_deref(),
+                expected,
+                "text={text:?}, pattern={pattern:?}, replacement={replacement:?}, flags={flags:?}"
+            );
+        }
+        assert!(compile_pattern("a", Some("qz")).is_none());
+        let quoted_space = compile_pattern(" ", Some("qx")).unwrap();
+        assert!(quoted_space.is_match("a b"));
+        assert!(!quoted_space.is_match("ab"));
+        // Numeric reference parsing is bounded even when N cannot fit usize.
+        let digits = "9".repeat(1_024);
+        let regex = compile_pattern("(a)", None).unwrap();
+        assert_eq!(
+            replace_xpath(&regex, "a".into(), &format!("${digits}"), false),
+            Some(digits[1..].to_owned())
+        );
+    }
 
     #[test]
     fn uuid() {
