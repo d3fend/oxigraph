@@ -1,0 +1,23 @@
+[package]
+name = "oxixml-regex"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+description = "Regular-expression engine for the XML Schema `pattern` facet and XPath/XQuery `fn:matches`, including back-references (pure-Rust alternative to regex + fancy-regex for XSD/XPath grammars)."
+keywords = ["regex", "xsd", "xpath", "regular-expression", "pattern"]
+categories = ["text-processing", "parser-implementations"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+oxixml-unicode = { workspace = true }
+
+[lints]
+workspace = true

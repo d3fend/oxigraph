@@ -26,6 +26,7 @@ hex.workspace = true
 json-event-parser.workspace = true
 md-5.workspace = true
 oxiri.workspace = true
+oxixml-regex.workspace = true
 oxrdf = { workspace = true, features = ["oxsdatatypes"] }
 oxsdatatypes.workspace = true
 rand.workspace = true

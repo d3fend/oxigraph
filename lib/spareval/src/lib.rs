@@ -378,16 +378,21 @@ impl QueryEvaluator {
         &self,
         expression: &sparopt::algebra::Expression,
         substitutions: impl IntoIterator<Item = (&'a Variable, Term)>,
-    ) -> Option<ExpressionTerm> {
+    ) -> Result<Option<ExpressionTerm>, QueryEvaluationError> {
         struct Context<'a> {
             now: Option<DateTime>,
             custom_functions: &'a CustomFunctionRegistry,
+            cancellation_token: Option<CancellationToken>,
         }
 
         impl<'a> ExpressionEvaluatorContext<'a> for Context<'a> {
             type Term = Term;
             type Tuple = HashMap<&'a Variable, Term>;
             type Error = QueryEvaluationError;
+
+            fn cancellation_token(&self) -> Option<CancellationToken> {
+                self.cancellation_token.clone()
+            }
 
             fn build_variable_lookup(
                 &mut self,
@@ -408,9 +413,11 @@ impl QueryEvaluator {
             fn build_exists(
                 &mut self,
                 _: &GraphPattern,
-            ) -> Result<impl Fn(&HashMap<&'a Variable, Term>) -> bool + 'a, QueryEvaluationError>
-            {
-                Err::<fn(&HashMap<&'a Variable, Term>) -> bool, _>(
+            ) -> Result<
+                impl Fn(&HashMap<&'a Variable, Term>) -> Result<bool, QueryEvaluationError> + 'a,
+                QueryEvaluationError,
+            > {
+                Err::<fn(&HashMap<&'a Variable, Term>) -> Result<bool, QueryEvaluationError>, _>(
                     QueryEvaluationError::Unexpected(
                         "EXISTS is not supported by the SPARQL expression evaluator".into(),
                     ),
@@ -461,34 +468,41 @@ impl QueryEvaluator {
             &mut Context {
                 now: None,
                 custom_functions: &self.custom_functions,
+                cancellation_token: self.cancellation_token.clone(),
             },
         )
-        .ok()?(&substitutions.into_iter().collect::<HashMap<_, _>>())
+        .map_err(QueryEvaluationError::from)?(
+            &substitutions.into_iter().collect::<HashMap<_, _>>()
+        )
+        .map_err(QueryEvaluationError::from)
     }
 
     /// Evaluates a SPARQL expression against an empty dataset with optional variable substitutions.
     ///
-    /// Returns the computed term or `None` if an error occurs or the expression is invalid.
+    /// Returns `Ok(None)` for an unbound value or a SPARQL expression error.
+    /// Execution failures, including resource limits, are returned as `Err`.
     pub fn evaluate_expression<'a>(
         &self,
         expression: &sparopt::algebra::Expression,
         substitutions: impl IntoIterator<Item = (&'a Variable, Term)>,
-    ) -> Option<Term> {
+    ) -> Result<Option<Term>, QueryEvaluationError> {
         self.eval_expression_term_with_substitutions(expression, substitutions)
-            .map(Into::into)
+            .map(|value| value.map(Into::into))
     }
 
     /// Evaluates a SPARQL expression effective boolean value (EBV) against an empty dataset
     /// with optional variable substitutions.
     ///
-    /// Returns the EBV or `None` if an error occurs or EBV is undefined for the result type.
+    /// Returns `Ok(None)` for a SPARQL expression error or undefined EBV.
+    /// Execution failures, including resource limits, are returned as `Err`.
     pub fn evaluate_effective_boolean_value_expression<'a>(
         &self,
         expression: &sparopt::algebra::Expression,
         substitutions: impl IntoIterator<Item = (&'a Variable, Term)>,
-    ) -> Option<bool> {
-        self.eval_expression_term_with_substitutions(expression, substitutions)?
-            .effective_boolean_value()
+    ) -> Result<Option<bool>, QueryEvaluationError> {
+        Ok(self
+            .eval_expression_term_with_substitutions(expression, substitutions)?
+            .and_then(|value| value.effective_boolean_value()))
     }
 
     /// Evaluates a SPARQL UPDATE DELETE/INSERT operation.
@@ -1170,7 +1184,9 @@ mod tests {
 
         // Simple literal
         let expr = Expression::from(Literal::from(3_i32));
-        let term = evaluator.evaluate_expression(&expr, std::iter::empty());
+        let term = evaluator
+            .evaluate_expression(&expr, std::iter::empty())
+            .unwrap();
         assert_eq!(term, Some(Term::from(Literal::from(3_i32))));
 
         // 1 + 2 = 3
@@ -1178,7 +1194,9 @@ mod tests {
             Box::new(Expression::from(Literal::from(1_i32))),
             Box::new(Expression::from(Literal::from(2_i32))),
         );
-        let term = evaluator.evaluate_expression(&add, std::iter::empty());
+        let term = evaluator
+            .evaluate_expression(&add, std::iter::empty())
+            .unwrap();
         assert_eq!(term, Some(Term::from(Literal::from(3_i32))));
     }
 
@@ -1193,7 +1211,7 @@ mod tests {
             Box::new(Expression::from(Literal::from(2_i32))),
         );
         let one: Term = Literal::from(1_i32).into();
-        let result = evaluator.evaluate_expression(&expr, [(&x, one)]);
+        let result = evaluator.evaluate_expression(&expr, [(&x, one)]).unwrap();
         assert_eq!(result, Some(Term::from(Literal::from(3_i32))));
     }
 
@@ -1202,7 +1220,9 @@ mod tests {
         let evaluator = QueryEvaluator::new();
         let x = Variable::new("x").unwrap();
         let expr = Expression::from(x);
-        let result = evaluator.evaluate_expression(&expr, std::iter::empty());
+        let result = evaluator
+            .evaluate_expression(&expr, std::iter::empty())
+            .unwrap();
         assert!(result.is_none());
     }
 
@@ -1214,11 +1234,15 @@ mod tests {
         let zero = Expression::from(Literal::from(0_i32));
         let five = Expression::from(Literal::from(5_i32));
         assert_eq!(
-            evaluator.evaluate_effective_boolean_value_expression(&zero, std::iter::empty()),
+            evaluator
+                .evaluate_effective_boolean_value_expression(&zero, std::iter::empty())
+                .unwrap(),
             Some(false)
         );
         assert_eq!(
-            evaluator.evaluate_effective_boolean_value_expression(&five, std::iter::empty()),
+            evaluator
+                .evaluate_effective_boolean_value_expression(&five, std::iter::empty())
+                .unwrap(),
             Some(true)
         );
 
@@ -1226,12 +1250,15 @@ mod tests {
         let empty_str = Expression::from(Literal::from(""));
         let non_empty_str = Expression::from(Literal::from("a"));
         assert_eq!(
-            evaluator.evaluate_effective_boolean_value_expression(&empty_str, std::iter::empty()),
+            evaluator
+                .evaluate_effective_boolean_value_expression(&empty_str, std::iter::empty())
+                .unwrap(),
             Some(false)
         );
         assert_eq!(
             evaluator
-                .evaluate_effective_boolean_value_expression(&non_empty_str, std::iter::empty()),
+                .evaluate_effective_boolean_value_expression(&non_empty_str, std::iter::empty())
+                .unwrap(),
             Some(true)
         );
     }
@@ -1244,14 +1271,17 @@ mod tests {
         let exists_empty = Expression::exists(GraphPattern::empty());
         assert_eq!(
             evaluator
-                .evaluate_effective_boolean_value_expression(&exists_empty, std::iter::empty()),
+                .evaluate_effective_boolean_value_expression(&exists_empty, std::iter::empty())
+                .unwrap(),
             Some(false)
         );
 
         // EXISTS { VALUES () {} } (empty singleton) -> true
         let exists_unit = Expression::exists(GraphPattern::empty_singleton());
         assert_eq!(
-            evaluator.evaluate_effective_boolean_value_expression(&exists_unit, std::iter::empty()),
+            evaluator
+                .evaluate_effective_boolean_value_expression(&exists_unit, std::iter::empty())
+                .unwrap(),
             Some(true)
         );
     }
@@ -1264,7 +1294,9 @@ mod tests {
         let iri = NamedNode::new("http://example.com/").unwrap();
         let nn = Expression::from(iri);
         assert_eq!(
-            evaluator.evaluate_effective_boolean_value_expression(&nn, std::iter::empty()),
+            evaluator
+                .evaluate_effective_boolean_value_expression(&nn, std::iter::empty())
+                .unwrap(),
             None
         );
 
@@ -1272,7 +1304,9 @@ mod tests {
         let dt = Literal::new_typed_literal("2020-01-01T00:00:00Z", xsd::DATE_TIME);
         let expr = Expression::from(dt);
         assert_eq!(
-            evaluator.evaluate_effective_boolean_value_expression(&expr, std::iter::empty()),
+            evaluator
+                .evaluate_effective_boolean_value_expression(&expr, std::iter::empty())
+                .unwrap(),
             None
         );
     }
@@ -1283,11 +1317,15 @@ mod tests {
         let one = Expression::from(Literal::new_typed_literal("1", xsd::BOOLEAN));
         let zero = Expression::from(Literal::new_typed_literal("0", xsd::BOOLEAN));
         assert_eq!(
-            evaluator.evaluate_effective_boolean_value_expression(&one, std::iter::empty()),
+            evaluator
+                .evaluate_effective_boolean_value_expression(&one, std::iter::empty())
+                .unwrap(),
             Some(true)
         );
         assert_eq!(
-            evaluator.evaluate_effective_boolean_value_expression(&zero, std::iter::empty()),
+            evaluator
+                .evaluate_effective_boolean_value_expression(&zero, std::iter::empty())
+                .unwrap(),
             Some(false)
         );
     }
@@ -1300,7 +1338,9 @@ mod tests {
         let errorish = Expression::from(NamedNode::new("http://e/iri").unwrap());
         let or_expr = Expression::or_all([errorish, Expression::from(Literal::from(false))]);
         assert_eq!(
-            evaluator.evaluate_effective_boolean_value_expression(&or_expr, std::iter::empty()),
+            evaluator
+                .evaluate_effective_boolean_value_expression(&or_expr, std::iter::empty())
+                .unwrap(),
             None
         );
 
@@ -1308,7 +1348,9 @@ mod tests {
         let errorish = Expression::from(NamedNode::new("http://e/iri2").unwrap());
         let and_expr = Expression::and_all([Expression::from(Literal::from(false)), errorish]);
         assert_eq!(
-            evaluator.evaluate_effective_boolean_value_expression(&and_expr, std::iter::empty()),
+            evaluator
+                .evaluate_effective_boolean_value_expression(&and_expr, std::iter::empty())
+                .unwrap(),
             Some(false)
         );
 
@@ -1316,7 +1358,9 @@ mod tests {
         let errorish = Expression::from(NamedNode::new("http://e/iri3").unwrap());
         let and_expr = Expression::and_all([Expression::from(Literal::from(true)), errorish]);
         assert_eq!(
-            evaluator.evaluate_effective_boolean_value_expression(&and_expr, std::iter::empty()),
+            evaluator
+                .evaluate_effective_boolean_value_expression(&and_expr, std::iter::empty())
+                .unwrap(),
             None
         );
     }
@@ -1328,7 +1372,9 @@ mod tests {
             Expression::from(Literal::from(1_i32)),
             Expression::from(Literal::from(1_i32)),
         );
-        let term = evaluator.evaluate_expression(&eq, std::iter::empty());
+        let term = evaluator
+            .evaluate_expression(&eq, std::iter::empty())
+            .unwrap();
         assert_eq!(term, Some(Term::from(Literal::from(true))));
     }
 
@@ -1340,7 +1386,9 @@ mod tests {
             Box::new(Expression::from(Literal::from(2_i32))),
             Box::new(Expression::from(x)),
         );
-        let result = evaluator.evaluate_expression(&expr, std::iter::empty());
+        let result = evaluator
+            .evaluate_expression(&expr, std::iter::empty())
+            .unwrap();
         assert!(result.is_none());
     }
 }

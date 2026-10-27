@@ -1738,6 +1738,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "54b4ed3a7192fa19f5f48f99871f2755047fabefd7f222f12a1df1773796a102"
 
 [[package]]
+name = "oxixml-regex"
+version = "0.1.2-d3fend.1"
+dependencies = [
+ "oxixml-unicode",
+]
+
+[[package]]
+name = "oxixml-unicode"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f4fe405939d195999b5e957038d6c66e14ee766c94a98b08309afa04548bdb6"
+
+[[package]]
 name = "oxjsonld"
 version = "0.2.4"
 dependencies = [
@@ -2562,6 +2575,7 @@ dependencies = [
  "json-event-parser",
  "md-5",
  "oxiri",
+ "oxixml-regex",
  "oxrdf",
  "oxsdatatypes",
  "rand",

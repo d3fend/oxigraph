@@ -3,7 +3,7 @@ use crate::dataset::ExpressionTriple;
 use crate::dataset::{ExpressionTerm, InternalQuad, QueryableDataset};
 use crate::error::QueryEvaluationError;
 use crate::expression::{
-    CustomFunctionRegistry, ExpressionEvaluator, ExpressionEvaluatorContext, NumericBinaryOperands,
+    CustomFunctionRegistry, ExpressionEvaluatorContext, NumericBinaryOperands,
     build_expression_evaluator, partial_cmp_literals, try_build_internal_expression_evaluator,
 };
 use crate::model::{QuerySolutionIter, QueryTripleIter};
@@ -43,6 +43,9 @@ use std::{fmt, io};
 
 type InternalTupleEvaluator<'a, T> =
     Rc<dyn Fn(InternalTuple<T>) -> InternalTuplesIterator<'a, T> + 'a>;
+
+type QueryExpressionEvaluator<'a, I, O> =
+    Rc<dyn Fn(&I) -> Result<Option<O>, QueryEvaluationError> + 'a>;
 
 const DEFAULT_TRANSITIVE_PATH_CACHE_MAX_EDGES: usize = 5_000_000;
 const DEFAULT_TRANSITIVE_PATH_CACHE_MAX_CLOSURES: usize = 200_000;
@@ -837,7 +840,7 @@ fn is_volatile_function(function: &Function, arity: usize) -> bool {
 fn exists_with_atom_evaluators<'a, T: Clone + 'a>(
     atoms: &[ExistsAtomEvaluator<'a, T>],
     tuple: InternalTuple<T>,
-) -> bool {
+) -> Result<bool, QueryEvaluationError> {
     let remaining = (0..atoms.len()).collect::<Vec<_>>();
     exists_with_atom_evaluators_recursive(atoms, tuple, &remaining)
 }
@@ -846,9 +849,9 @@ fn exists_with_atom_evaluators_recursive<'a, T: Clone + 'a>(
     atoms: &[ExistsAtomEvaluator<'a, T>],
     tuple: InternalTuple<T>,
     remaining: &[usize],
-) -> bool {
+) -> Result<bool, QueryEvaluationError> {
     if remaining.is_empty() {
-        return true;
+        return Ok(true);
     }
     let mut best_pos = 0;
     let mut best_score = 0;
@@ -864,16 +867,11 @@ fn exists_with_atom_evaluators_recursive<'a, T: Clone + 'a>(
     next_remaining.extend_from_slice(&remaining[..best_pos]);
     next_remaining.extend_from_slice(&remaining[best_pos + 1..]);
     for candidate in (atoms[atom_index].evaluator)(tuple.clone()) {
-        match candidate {
-            Ok(next_tuple) => {
-                if exists_with_atom_evaluators_recursive(atoms, next_tuple, &next_remaining) {
-                    return true;
-                }
-            }
-            Err(_) => return true,
+        if exists_with_atom_evaluators_recursive(atoms, candidate?, &next_remaining)? {
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 fn exists_cache_enabled_from_env() -> bool {
@@ -1359,6 +1357,12 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
         let mut error = None;
         for solution in eval(from) {
             if let Err(e) = solution {
+                if matches!(
+                    e,
+                    QueryEvaluationError::ResourceLimit { .. } | QueryEvaluationError::Cancelled
+                ) {
+                    return (Err(e), stats);
+                }
                 // We keep the first error
                 error.get_or_insert(e);
             } else {
@@ -2363,15 +2367,19 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                             // Cartesian product
                             Rc::new(move |from| {
                                 let mut errors = Vec::default();
-                                let built_values = build(from.clone())
-                                    .filter_map(|result| match result {
-                                        Ok(result) => Some(result),
-                                        Err(error) => {
-                                            errors.push(Err(error));
-                                            None
+                                let mut built_values = Vec::new();
+                                for result in build(from.clone()) {
+                                    match result {
+                                        Ok(result) => built_values.push(result),
+                                        Err(
+                                            error @ (QueryEvaluationError::ResourceLimit { .. }
+                                            | QueryEvaluationError::Cancelled),
+                                        ) => {
+                                            return Box::new(once(Err(error)));
                                         }
-                                    })
-                                    .collect::<Vec<_>>();
+                                        Err(error) => errors.push(Err(error)),
+                                    }
+                                }
                                 if built_values.is_empty() && errors.is_empty() {
                                     // We don't bother to execute the other side
                                     return Box::new(empty());
@@ -2396,15 +2404,18 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                             Rc::new(move |from| {
                                 let mut errors = Vec::default();
                                 let mut built_values = InternalTupleSet::new(keys.clone());
-                                built_values.extend(build(from.clone()).filter_map(|result| {
+                                for result in build(from.clone()) {
                                     match result {
-                                        Ok(result) => Some(result),
-                                        Err(error) => {
-                                            errors.push(Err(error));
-                                            None
+                                        Ok(result) => built_values.insert(result),
+                                        Err(
+                                            error @ (QueryEvaluationError::ResourceLimit { .. }
+                                            | QueryEvaluationError::Cancelled),
+                                        ) => {
+                                            return Box::new(once(Err(error)));
                                         }
+                                        Err(error) => errors.push(Err(error)),
                                     }
-                                }));
+                                }
                                 if built_values.is_empty() && errors.is_empty() {
                                     // We don't bother to execute the other side
                                     return Box::new(empty());
@@ -2485,8 +2496,11 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                     MinusAlgorithm::HashBuildRightProbeLeft { keys } => {
                         if keys.is_empty() {
                             Rc::new(move |from| {
-                                let right: Vec<_> =
-                                    right(from.clone()).filter_map(Result::ok).collect();
+                                let right = match right(from.clone()).collect::<Result<Vec<_>, _>>()
+                                {
+                                    Ok(right) => right,
+                                    Err(error) => return Box::new(once(Err(error))),
+                                };
                                 if right.is_empty() {
                                     return left(from);
                                 }
@@ -2512,7 +2526,12 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                                 .collect::<Vec<_>>();
                             Rc::new(move |from| {
                                 let mut right_values = InternalTupleSet::new(keys.clone());
-                                right_values.extend(right(from.clone()).filter_map(Result::ok));
+                                for result in right(from.clone()) {
+                                    match result {
+                                        Ok(tuple) => right_values.insert(tuple),
+                                        Err(error) => return Box::new(once(Err(error))),
+                                    }
+                                }
                                 if right_values.is_empty() {
                                     return left(from);
                                 }
@@ -2563,15 +2582,18 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                         Rc::new(move |from| {
                             let mut errors = Vec::default();
                             let mut right_values = InternalTupleSet::new(keys.clone());
-                            right_values.extend(right(from.clone()).filter_map(
-                                |result| match result {
-                                    Ok(result) => Some(result),
-                                    Err(error) => {
-                                        errors.push(Err(error));
-                                        None
+                            for result in right(from.clone()) {
+                                match result {
+                                    Ok(result) => right_values.insert(result),
+                                    Err(
+                                        error @ (QueryEvaluationError::ResourceLimit { .. }
+                                        | QueryEvaluationError::Cancelled),
+                                    ) => {
+                                        return Box::new(once(Err(error)));
                                     }
-                                },
-                            ));
+                                    Err(error) => errors.push(Err(error)),
+                                }
+                            }
                             if right_values.is_empty() && errors.is_empty() {
                                 return left(from);
                             }
@@ -2596,9 +2618,13 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                 )?;
                 Rc::new(move |from| {
                     let expression = Rc::clone(&expression);
-                    Box::new(child(from).filter(move |tuple| match tuple {
-                        Ok(tuple) => expression(tuple).unwrap_or(false),
-                        Err(_) => true,
+                    Box::new(child(from).filter_map(move |tuple| match tuple {
+                        Ok(tuple) => match expression(&tuple) {
+                            Ok(Some(true)) => Some(Ok(tuple)),
+                            Ok(Some(false) | None) => None,
+                            Err(error) => Some(Err(error)),
+                        },
+                        Err(error) => Some(Err(error)),
                     }))
                 })
             }
@@ -2641,7 +2667,7 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                         let expression = Rc::clone(&expression);
                         Box::new(child(from).map(move |tuple| {
                             let mut tuple = tuple?;
-                            if let Some(value) = expression(&tuple) {
+                            if let Some(value) = expression(&tuple)? {
                                 tuple.set(position, value);
                             }
                             Ok(tuple)
@@ -2657,7 +2683,7 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                     let dataset = dataset.clone();
                     Box::new(child(from).map(move |tuple| {
                         let mut tuple = tuple?;
-                        if let Some(value) = expression(&tuple) {
+                        if let Some(value) = expression(&tuple)? {
                             tuple.set(position, dataset.internalize_expression_term(value)?);
                         }
                         Ok(tuple)
@@ -2690,40 +2716,40 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                     })
                     .collect::<Result<Vec<_>, QueryEvaluationError>>()?;
                 Rc::new(move |from| {
-                    let mut errors = Vec::default();
-                    let mut values = child(from)
-                        .filter_map(|result| match result {
-                            Ok(result) => Some(result),
-                            Err(error) => {
-                                errors.push(Err(error));
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>();
+                    // Evaluate keys before sorting: the comparator itself cannot
+                    // propagate a resource failure, and must not hide one.
+                    let mut values = Vec::new();
+                    for result in child(from) {
+                        let tuple = match result {
+                            Ok(tuple) => tuple,
+                            Err(error) => return Box::new(once(Err(error))),
+                        };
+                        let keys = by
+                            .iter()
+                            .map(|comp| match comp {
+                                ComparatorFunction::Asc(expression)
+                                | ComparatorFunction::Desc(expression) => expression(&tuple),
+                            })
+                            .collect::<Result<Vec<_>, _>>();
+                        let keys = match keys {
+                            Ok(keys) => keys,
+                            Err(error) => return Box::new(once(Err(error))),
+                        };
+                        values.push((tuple, keys));
+                    }
                     values.sort_unstable_by(|a, b| {
-                        for comp in &by {
-                            match comp {
-                                ComparatorFunction::Asc(expression) => {
-                                    match cmp_terms(expression(a).as_ref(), expression(b).as_ref())
-                                    {
-                                        Ordering::Greater => return Ordering::Greater,
-                                        Ordering::Less => return Ordering::Less,
-                                        Ordering::Equal => (),
-                                    }
-                                }
-                                ComparatorFunction::Desc(expression) => {
-                                    match cmp_terms(expression(a).as_ref(), expression(b).as_ref())
-                                    {
-                                        Ordering::Greater => return Ordering::Less,
-                                        Ordering::Less => return Ordering::Greater,
-                                        Ordering::Equal => (),
-                                    }
-                                }
+                        for ((comp, a), b) in by.iter().zip(&a.1).zip(&b.1) {
+                            let order = cmp_terms(a.as_ref(), b.as_ref());
+                            if order != Ordering::Equal {
+                                return match comp {
+                                    ComparatorFunction::Asc(_) => order,
+                                    ComparatorFunction::Desc(_) => order.reverse(),
+                                };
                             }
                         }
                         Ordering::Equal
                     });
-                    Box::new(errors.into_iter().chain(values.into_iter().map(Ok)))
+                    Box::new(values.into_iter().map(|(tuple, _)| Ok(tuple)))
                 })
             }
             GraphPattern::Distinct { inner } => {
@@ -2754,7 +2780,17 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                 #[expect(clippy::shadow_same)]
                 let start = *start;
                 if start > 0 {
-                    child = Rc::new(move |from| Box::new(child(from).skip(start)));
+                    child = Rc::new(move |from| {
+                        let mut remaining = start;
+                        Box::new(child(from).filter_map(move |tuple| {
+                            if tuple.is_ok() && remaining > 0 {
+                                remaining -= 1;
+                                None
+                            } else {
+                                Some(tuple)
+                            }
+                        }))
+                    });
                 }
                 if let Some(length) = *length {
                     child = Rc::new(move |from| Box::new(child(from).take(length)));
@@ -2831,7 +2867,6 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                 Rc::new(move |from| {
                     let tuple_size = from.capacity();
                     let key_variables = Rc::clone(&key_variables);
-                    let mut errors = Vec::default();
                     let mut accumulators_for_group = FxHashMap::<
                         Vec<Option<D::InternalTerm>>,
                         Vec<AccumulatorWrapper<'_, D::InternalTerm>>,
@@ -2843,56 +2878,51 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                             accumulator_builders.iter().map(|c| c()).collect::<Vec<_>>(),
                         );
                     }
-                    child(from)
-                        .filter_map(|result| match result {
-                            Ok(result) => Some(result),
-                            Err(error) => {
-                                errors.push(error);
-                                None
-                            }
-                        })
-                        .for_each(|tuple| {
-                            // TODO avoid copy for key?
-                            let key = key_variables
-                                .iter()
-                                .map(|v| tuple.get(*v).cloned())
-                                .collect();
+                    for result in child(from) {
+                        let tuple = match result {
+                            Ok(tuple) => tuple,
+                            Err(error) => return Box::new(once(Err(error))),
+                        };
+                        // TODO avoid copy for key?
+                        let key = key_variables
+                            .iter()
+                            .map(|v| tuple.get(*v).cloned())
+                            .collect();
 
-                            let key_accumulators =
-                                accumulators_for_group.entry(key).or_insert_with(|| {
-                                    accumulator_builders.iter().map(|c| c()).collect::<Vec<_>>()
-                                });
-                            for accumulator in key_accumulators {
-                                accumulator.accumulate(&tuple);
+                        let key_accumulators =
+                            accumulators_for_group.entry(key).or_insert_with(|| {
+                                accumulator_builders.iter().map(|c| c()).collect::<Vec<_>>()
+                            });
+                        for accumulator in key_accumulators {
+                            if let Err(error) = accumulator.accumulate(&tuple) {
+                                return Box::new(once(Err(error)));
                             }
-                        });
+                        }
+                    }
                     let accumulator_variables = accumulator_variables.clone();
                     let dataset = dataset.clone();
                     Box::new(
-                        errors
+                        accumulators_for_group
                             .into_iter()
-                            .map(Err)
-                            .chain(accumulators_for_group.into_iter().map(
-                                move |(key, accumulators)| {
-                                    let mut result = InternalTuple::with_capacity(tuple_size);
-                                    for (variable, value) in key_variables.iter().zip(key) {
-                                        if let Some(value) = value {
-                                            result.set(*variable, value);
-                                        }
+                            .map(move |(key, accumulators)| {
+                                let mut result = InternalTuple::with_capacity(tuple_size);
+                                for (variable, value) in key_variables.iter().zip(key) {
+                                    if let Some(value) = value {
+                                        result.set(*variable, value);
                                     }
-                                    for (accumulator, variable) in
-                                        accumulators.into_iter().zip(&accumulator_variables)
-                                    {
-                                        if let Some(value) = accumulator.finish() {
-                                            result.set(
-                                                *variable,
-                                                dataset.internalize_expression_term(value)?,
-                                            );
-                                        }
+                                }
+                                for (accumulator, variable) in
+                                    accumulators.into_iter().zip(&accumulator_variables)
+                                {
+                                    if let Some(value) = accumulator.finish() {
+                                        result.set(
+                                            *variable,
+                                            dataset.internalize_expression_term(value)?,
+                                        );
                                     }
-                                    Ok(result)
-                                },
-                            )),
+                                }
+                                Ok(result)
+                            }),
                     )
                 })
             }
@@ -2924,7 +2954,13 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                                 .transpose()
                         })),
                         Err(e) => {
-                            if silent {
+                            if silent
+                                && !matches!(
+                                    e,
+                                    QueryEvaluationError::ResourceLimit { .. }
+                                        | QueryEvaluationError::Cancelled
+                                )
+                            {
                                 Box::new(once(Ok(from)))
                             } else {
                                 Box::new(once(Err(e)))
@@ -3137,24 +3173,27 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
     /// Evaluates an expression and returns an internal term
     ///
     /// Returns None if building such expression would mean to convert back to an internal term at the end.
-    #[expect(clippy::type_complexity)]
     fn internal_expression_evaluator(
         &self,
         expression: &Expression,
         encoded_variables: &mut Vec<Variable>,
         stat_children: &mut Vec<Rc<EvalNodeWithStats>>,
     ) -> Result<
-        Option<Rc<dyn Fn(&InternalTuple<D::InternalTerm>) -> Option<D::InternalTerm> + 'a>>,
+        Option<QueryExpressionEvaluator<'a, InternalTuple<D::InternalTerm>, D::InternalTerm>>,
         QueryEvaluationError,
     > {
-        Ok(try_build_internal_expression_evaluator(
+        let Some(eval) = try_build_internal_expression_evaluator(
             expression,
             &mut ExpressionContext {
                 evaluator: self,
                 encoded_variables,
                 stat_children,
             },
-        )?)
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Rc::new(move |tuple| eval(tuple).map_err(Into::into))))
     }
 
     /// Evaluate an expression and return its effective boolean value
@@ -3163,21 +3202,29 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
         expression: &Expression,
         encoded_variables: &mut Vec<Variable>,
         stat_children: &mut Vec<Rc<EvalNodeWithStats>>,
-    ) -> Result<ExpressionEvaluator<'a, InternalTuple<D::InternalTerm>, bool>, QueryEvaluationError>
-    {
+    ) -> Result<
+        QueryExpressionEvaluator<'a, InternalTuple<D::InternalTerm>, bool>,
+        QueryEvaluationError,
+    > {
         // TODO: avoid dyn?
         if let Some(eval) =
             self.internal_expression_evaluator(expression, encoded_variables, stat_children)?
         {
             let dataset = self.dataset.clone();
             return Ok(Rc::new(move |tuple| {
-                dataset
-                    .internal_term_effective_boolean_value(eval(tuple)?)
-                    .ok()?
+                let Some(value) = eval(tuple)? else {
+                    return Ok(None);
+                };
+                Ok(dataset
+                    .internal_term_effective_boolean_value(value)
+                    .ok()
+                    .flatten())
             }));
         }
         let eval = self.expression_evaluator(expression, encoded_variables, stat_children)?;
-        Ok(Rc::new(move |tuple| eval(tuple)?.effective_boolean_value()))
+        Ok(Rc::new(move |tuple| {
+            Ok(eval(tuple)?.and_then(|value| value.effective_boolean_value()))
+        }))
     }
 
     /// Evaluate an expression and return an explicit ExpressionTerm
@@ -3187,17 +3234,18 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
         encoded_variables: &mut Vec<Variable>,
         stat_children: &mut Vec<Rc<EvalNodeWithStats>>,
     ) -> Result<
-        ExpressionEvaluator<'a, InternalTuple<D::InternalTerm>, ExpressionTerm>,
+        QueryExpressionEvaluator<'a, InternalTuple<D::InternalTerm>, ExpressionTerm>,
         QueryEvaluationError,
     > {
-        Ok(build_expression_evaluator(
+        let eval = build_expression_evaluator(
             expression,
             &mut ExpressionContext {
                 evaluator: self,
                 encoded_variables,
                 stat_children,
             },
-        )?)
+        )?;
+        Ok(Rc::new(move |tuple| eval(tuple).map_err(Into::into)))
     }
 
     fn encode_term(&self, term: impl Into<Term>) -> Result<D::InternalTerm, QueryEvaluationError> {
@@ -3301,7 +3349,10 @@ impl<'a, D: QueryableDataset<'a>> ExpressionEvaluatorContext<'a>
     fn build_exists(
         &mut self,
         plan: &GraphPattern,
-    ) -> Result<impl Fn(&InternalTuple<D::InternalTerm>) -> bool + 'a, QueryEvaluationError> {
+    ) -> Result<
+        impl Fn(&InternalTuple<D::InternalTerm>) -> Result<bool, QueryEvaluationError> + 'a,
+        QueryEvaluationError,
+    > {
         let outer_variable_count = self.encoded_variables.len();
         let mut correlated_variable_indexes = Vec::new();
         plan.lookup_used_variables(&mut |variable| {
@@ -3318,43 +3369,47 @@ impl<'a, D: QueryableDataset<'a>> ExpressionEvaluatorContext<'a>
             .next_exists_evaluator_id
             .set(exists_evaluator_id.saturating_add(1));
         let mut join_atoms = Vec::new();
-        let eval_exists: Rc<dyn Fn(&InternalTuple<D::InternalTerm>) -> bool + 'a> =
-            if collect_exists_join_atoms(plan, &mut join_atoms) && join_atoms.len() > 1 {
-                let mut atom_evaluators = Vec::with_capacity(join_atoms.len());
-                for atom in join_atoms {
-                    let (atom_eval, atom_stats) = self
-                        .evaluator
-                        .graph_pattern_evaluator(atom, self.encoded_variables);
-                    self.stat_children.push(atom_stats);
-                    let atom_eval = atom_eval?;
-                    let mut variable_indexes = Vec::new();
-                    atom.lookup_used_variables(&mut |variable| {
-                        if let Some(index) = slice_key(self.encoded_variables, variable) {
-                            variable_indexes.push(index);
-                        }
-                    });
-                    variable_indexes.sort_unstable();
-                    variable_indexes.dedup();
-                    atom_evaluators.push(ExistsAtomEvaluator {
-                        evaluator: atom_eval,
-                        variable_indexes: Arc::from(variable_indexes),
-                    });
-                }
-                let atom_evaluators: Arc<[ExistsAtomEvaluator<'a, D::InternalTerm>]> =
-                    Arc::from(atom_evaluators);
-                Rc::new(move |tuple: &InternalTuple<D::InternalTerm>| {
-                    exists_with_atom_evaluators(atom_evaluators.as_ref(), tuple.clone())
-                })
-            } else {
-                let (eval, stats) = self
+        let eval_exists: Rc<
+            dyn Fn(&InternalTuple<D::InternalTerm>) -> Result<bool, QueryEvaluationError> + 'a,
+        > = if collect_exists_join_atoms(plan, &mut join_atoms) && join_atoms.len() > 1 {
+            let mut atom_evaluators = Vec::with_capacity(join_atoms.len());
+            for atom in join_atoms {
+                let (atom_eval, atom_stats) = self
                     .evaluator
-                    .graph_pattern_evaluator(plan, self.encoded_variables);
-                self.stat_children.push(stats);
-                let eval = eval?;
-                Rc::new(move |tuple: &InternalTuple<D::InternalTerm>| {
-                    eval(tuple.clone()).next().is_some()
-                })
-            };
+                    .graph_pattern_evaluator(atom, self.encoded_variables);
+                self.stat_children.push(atom_stats);
+                let atom_eval = atom_eval?;
+                let mut variable_indexes = Vec::new();
+                atom.lookup_used_variables(&mut |variable| {
+                    if let Some(index) = slice_key(self.encoded_variables, variable) {
+                        variable_indexes.push(index);
+                    }
+                });
+                variable_indexes.sort_unstable();
+                variable_indexes.dedup();
+                atom_evaluators.push(ExistsAtomEvaluator {
+                    evaluator: atom_eval,
+                    variable_indexes: Arc::from(variable_indexes),
+                });
+            }
+            let atom_evaluators: Arc<[ExistsAtomEvaluator<'a, D::InternalTerm>]> =
+                Arc::from(atom_evaluators);
+            Rc::new(move |tuple: &InternalTuple<D::InternalTerm>| {
+                exists_with_atom_evaluators(atom_evaluators.as_ref(), tuple.clone())
+            })
+        } else {
+            let (eval, stats) = self
+                .evaluator
+                .graph_pattern_evaluator(plan, self.encoded_variables);
+            self.stat_children.push(stats);
+            let eval = eval?;
+            Rc::new(move |tuple: &InternalTuple<D::InternalTerm>| {
+                eval(tuple.clone())
+                    .next()
+                    .transpose()
+                    .map(|row| row.is_some())
+            })
+        };
         let exists_cache = Rc::clone(&self.evaluator.exists_cache);
         let volatile_exists = graph_pattern_contains_volatile_expression(plan);
         let use_cache = {
@@ -3384,11 +3439,11 @@ impl<'a, D: QueryableDataset<'a>> ExpressionEvaluatorContext<'a>
                 ExistsCacheMode::Disabled => eval_exists(tuple),
                 ExistsCacheMode::Uncorrelated(result_once) => {
                     if let Some(cached) = result_once.get() {
-                        return cached;
+                        return Ok(cached);
                     }
-                    let value = eval_exists(tuple);
+                    let value = eval_exists(tuple)?;
                     result_once.set(Some(value));
-                    value
+                    Ok(value)
                 }
                 ExistsCacheMode::Unary(correlated_index) => {
                     if !use_cache {
@@ -3399,14 +3454,14 @@ impl<'a, D: QueryableDataset<'a>> ExpressionEvaluatorContext<'a>
                         let cache = exists_cache.borrow();
                         cache.get_unary(exists_evaluator_id, &binding)
                     } {
-                        return cached;
+                        return Ok(cached);
                     }
-                    let value = eval_exists(tuple);
+                    let value = eval_exists(tuple)?;
                     {
                         let mut cache = exists_cache.borrow_mut();
                         cache.maybe_insert_unary(exists_evaluator_id, binding, value);
                     }
-                    value
+                    Ok(value)
                 }
                 ExistsCacheMode::General => {
                     if !use_cache {
@@ -3423,17 +3478,21 @@ impl<'a, D: QueryableDataset<'a>> ExpressionEvaluatorContext<'a>
                         let cache = exists_cache.borrow();
                         cache.get(&key)
                     } {
-                        return cached;
+                        return Ok(cached);
                     }
-                    let value = eval_exists(tuple);
+                    let value = eval_exists(tuple)?;
                     {
                         let mut cache = exists_cache.borrow_mut();
                         cache.maybe_insert(key, value);
                     }
-                    value
+                    Ok(value)
                 }
             },
         )
+    }
+
+    fn cancellation_token(&self) -> Option<CancellationToken> {
+        Some(self.evaluator.dataset.cancellation_token.clone())
     }
 
     fn internalize_named_node(
@@ -3625,32 +3684,32 @@ enum AccumulatorWrapper<'a, T> {
         count: u64,
     },
     CountInternal {
-        evaluator: Rc<dyn Fn(&InternalTuple<T>) -> Option<T> + 'a>,
+        evaluator: QueryExpressionEvaluator<'a, InternalTuple<T>, T>,
         count: u64,
     },
     CountDistinctInternal {
         seen: FxHashSet<T>,
-        evaluator: Rc<dyn Fn(&InternalTuple<T>) -> Option<T> + 'a>,
+        evaluator: QueryExpressionEvaluator<'a, InternalTuple<T>, T>,
         count: u64,
     },
     Sample {
         // TODO: add internal variant
-        evaluator: Rc<dyn Fn(&InternalTuple<T>) -> Option<ExpressionTerm> + 'a>,
+        evaluator: QueryExpressionEvaluator<'a, InternalTuple<T>, ExpressionTerm>,
         value: Option<ExpressionTerm>,
     },
     Expression {
-        evaluator: Rc<dyn Fn(&InternalTuple<T>) -> Option<ExpressionTerm> + 'a>,
+        evaluator: QueryExpressionEvaluator<'a, InternalTuple<T>, ExpressionTerm>,
         accumulator: Option<Box<dyn Accumulator>>,
     },
     DistinctExpression {
         seen: FxHashSet<ExpressionTerm>,
-        evaluator: Rc<dyn Fn(&InternalTuple<T>) -> Option<ExpressionTerm> + 'a>,
+        evaluator: QueryExpressionEvaluator<'a, InternalTuple<T>, ExpressionTerm>,
         accumulator: Option<Box<dyn Accumulator>>,
     },
 }
 
 impl<T: Clone + Eq + Hash> AccumulatorWrapper<'_, T> {
-    fn accumulate(&mut self, tuple: &InternalTuple<T>) {
+    fn accumulate(&mut self, tuple: &InternalTuple<T>) -> Result<(), QueryEvaluationError> {
         match self {
             Self::CountTuple { count } => {
                 *count += 1;
@@ -3661,7 +3720,7 @@ impl<T: Clone + Eq + Hash> AccumulatorWrapper<'_, T> {
                 }
             }
             Self::CountInternal { evaluator, count } => {
-                if evaluator(tuple).is_some() {
+                if evaluator(tuple)?.is_some() {
                     *count += 1;
                 }
             }
@@ -3670,8 +3729,8 @@ impl<T: Clone + Eq + Hash> AccumulatorWrapper<'_, T> {
                 evaluator,
                 count,
             } => {
-                let Some(value) = evaluator(tuple) else {
-                    return;
+                let Some(value) = evaluator(tuple)? else {
+                    return Ok(());
                 };
                 if seen.insert(value) {
                     *count += 1;
@@ -3679,23 +3738,23 @@ impl<T: Clone + Eq + Hash> AccumulatorWrapper<'_, T> {
             }
             Self::Sample { evaluator, value } => {
                 if value.is_some() {
-                    return; // We already got a value
+                    return Ok(()); // We already got a value
                 }
-                *value = evaluator(tuple);
+                *value = evaluator(tuple)?;
             }
             Self::Expression {
                 evaluator,
                 accumulator,
             } => {
                 if accumulator.is_none() {
-                    return; // Already failed
+                    return Ok(()); // Already failed
                 }
-                let Some(value) = evaluator(tuple) else {
+                let Some(value) = evaluator(tuple)? else {
                     *accumulator = None;
-                    return;
+                    return Ok(());
                 };
                 let Some(accumulator) = accumulator else {
-                    return;
+                    return Ok(());
                 };
                 accumulator.accumulate(value);
             }
@@ -3705,20 +3764,21 @@ impl<T: Clone + Eq + Hash> AccumulatorWrapper<'_, T> {
                 accumulator,
             } => {
                 if accumulator.is_none() {
-                    return; // Already failed
+                    return Ok(()); // Already failed
                 }
-                let Some(value) = evaluator(tuple) else {
+                let Some(value) = evaluator(tuple)? else {
                     *accumulator = None;
-                    return;
+                    return Ok(());
                 };
                 let Some(accumulator) = accumulator else {
-                    return;
+                    return Ok(());
                 };
                 if seen.insert(value.clone()) {
                     accumulator.accumulate(value);
                 }
             }
         }
+        Ok(())
     }
 
     fn finish(self) -> Option<ExpressionTerm> {
@@ -5805,7 +5865,7 @@ struct HashLeftJoinIterator<'a, T> {
     left_iter: InternalTuplesIterator<'a, T>,
     right: InternalTupleSet<T>,
     buffered_results: Vec<Result<InternalTuple<T>, QueryEvaluationError>>,
-    expression: Rc<dyn Fn(&InternalTuple<T>) -> Option<bool> + 'a>,
+    expression: QueryExpressionEvaluator<'a, InternalTuple<T>, bool>,
 }
 
 impl<T: Clone + Eq + Hash> Iterator for HashLeftJoinIterator<'_, T> {
@@ -5820,14 +5880,21 @@ impl<T: Clone + Eq + Hash> Iterator for HashLeftJoinIterator<'_, T> {
                 Ok(left_tuple) => left_tuple,
                 Err(error) => return Some(Err(error)),
             };
-            self.buffered_results.extend(
-                self.right
-                    .get(&left_tuple)
-                    .iter()
-                    .filter_map(|right_tuple| left_tuple.combine_with(right_tuple))
-                    .filter(|tuple| (self.expression)(tuple).unwrap_or(false))
-                    .map(Ok),
-            );
+            for tuple in self
+                .right
+                .get(&left_tuple)
+                .iter()
+                .filter_map(|right_tuple| left_tuple.combine_with(right_tuple))
+            {
+                match (self.expression)(&tuple) {
+                    Ok(Some(true)) => self.buffered_results.push(Ok(tuple)),
+                    Ok(Some(false) | None) => (),
+                    Err(error) => {
+                        self.buffered_results.clear();
+                        return Some(Err(error));
+                    }
+                }
+            }
             if self.buffered_results.is_empty() {
                 // We have not manage to join with anything
                 return Some(Ok(left_tuple));
@@ -6328,8 +6395,8 @@ impl<
 }
 
 enum ComparatorFunction<'a, T> {
-    Asc(Rc<dyn Fn(&InternalTuple<T>) -> Option<ExpressionTerm> + 'a>),
-    Desc(Rc<dyn Fn(&InternalTuple<T>) -> Option<ExpressionTerm> + 'a>),
+    Asc(QueryExpressionEvaluator<'a, InternalTuple<T>, ExpressionTerm>),
+    Desc(QueryExpressionEvaluator<'a, InternalTuple<T>, ExpressionTerm>),
 }
 
 struct InternalTupleSet<T> {

@@ -8,6 +8,7 @@ members = [
   "lib/oxrdfio",
   "lib/oxrdfxml",
   "lib/oxsdatatypes",
+  "lib/oxxpath-regex",
   "lib/oxttl",
   "lib/sparesults",
   "lib/spareval",
@@ -90,6 +91,7 @@ oxrdfio = { version = "=0.2.4", path = "lib/oxrdfio" }
 oxrdfxml = { version = "=0.2.3", path = "lib/oxrdfxml" }
 oxrocksdb-sys = { version = "=0.5.6", path = "./oxrocksdb-sys" }
 oxsdatatypes = { version = "=0.2.2", path = "lib/oxsdatatypes" }
+oxixml-regex = { version = "=0.1.2-d3fend.1", path = "lib/oxxpath-regex" }
 oxttl = { version = "=0.2.3", path = "lib/oxttl" }
 spargebra = { version = "=0.4.6", path = "lib/spargebra" }
 spargeo = { version = "=0.5.4", path = "lib/spargeo" }

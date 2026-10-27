@@ -1,0 +1,132 @@
+{
+  "upstream": "cool-japan/oxixml",
+  "version": "0.1.2",
+  "download": "https://crates.io/api/v1/crates/oxixml-regex/0.1.2/download",
+  "archiveBytes": 179296,
+  "archiveSha256": "e765f73cac537d1a8462bc368cfed614e444748f9d856369c4a7c68f9b0c8420",
+  "upstreamFiles": [
+    {
+      "path": ".cargo_vcs_info.json",
+      "bytes": 114,
+      "sha256": "cfb676a3ac704237e2d2530ebd89b199ae09cd6be21862b3c2933b174bc19782"
+    },
+    {
+      "path": "Cargo.lock",
+      "bytes": 392,
+      "sha256": "aff1b22e6cbf51611d14005e6532ca32c6c31fee4dd07af6820476c966b744c4"
+    },
+    {
+      "path": "Cargo.toml",
+      "bytes": 1770,
+      "sha256": "aa08baa54d9de95d4f227da7bf5fbea60cff321e3ff0b798eb06a1b83852e18f"
+    },
+    {
+      "path": "Cargo.toml.orig",
+      "bytes": 734,
+      "sha256": "5f17773c676c255543c1843bd13939104b0c64aa99485df82b80b616f4e37fc7"
+    },
+    {
+      "path": "LICENSE",
+      "bytes": 10757,
+      "sha256": "10c4dfecc3c201af1e3378614411ec4269118947f312c8580d387e6ccc149ad2"
+    },
+    {
+      "path": "README.md",
+      "bytes": 2663,
+      "sha256": "59c446b17b793e15184ffcb31a5e20db8a48cf75d61d9b42d5268d1a660a6ead"
+    },
+    {
+      "path": "src/ast.rs",
+      "bytes": 4450,
+      "sha256": "a906c5bdb56d77632e562d13038a8ed2343a8496b138cded10643b50e34af3b5"
+    },
+    {
+      "path": "src/backtrack.rs",
+      "bytes": 16164,
+      "sha256": "b6cfb6f3d21442c333f047014e4a1cb2396f91212718af1a8cf3f92ac770a9cf"
+    },
+    {
+      "path": "src/charclass.rs",
+      "bytes": 23728,
+      "sha256": "fd668c78fa03ecd5a6ef1402d39106bc1fd9e065554a6d1e8a99a44611c58876"
+    },
+    {
+      "path": "src/error.rs",
+      "bytes": 5852,
+      "sha256": "d424f1d8f486cf75f77e9ee0cad8d828d039aeb00a6daeb2a7aaa24e5a4f66cb"
+    },
+    {
+      "path": "src/lib.rs",
+      "bytes": 28888,
+      "sha256": "55364103ac0fc33d6ba7c8f960c77539a3dd1d855eb3829e8755014f54a30920"
+    },
+    {
+      "path": "src/matches.rs",
+      "bytes": 10996,
+      "sha256": "6358b6be66cac07a579b8b0b29e5e8556faf52893c787a01c4e63ba41974c702"
+    },
+    {
+      "path": "src/parser.rs",
+      "bytes": 48464,
+      "sha256": "865e30915fd1bc1878542a02a4b277017cbd321a51043cab025494e3f84562ee"
+    },
+    {
+      "path": "src/pikevm.rs",
+      "bytes": 6246,
+      "sha256": "dd663d212b5b0e5af3cc9c16b28a95de886f6171e0563fca0c8fc7233cc1a657"
+    },
+    {
+      "path": "src/program.rs",
+      "bytes": 7811,
+      "sha256": "525b286784f68f84e36bbd2911982e0482ad10762cfca5289043bed979eb5430"
+    },
+    {
+      "path": "src/replace.rs",
+      "bytes": 6024,
+      "sha256": "709e5085d254522645122d4837e3ce903be0a91500948413e821e4672e14f0c5"
+    },
+    {
+      "path": "tests/find_iter.rs",
+      "bytes": 9299,
+      "sha256": "8a1d120d4d429b4576da3faf5fc7e8f9b351687aab8f7e4132fc7c5ef60e6c19"
+    },
+    {
+      "path": "tests/qt3_forx0002.rs",
+      "bytes": 5432,
+      "sha256": "217b6398f5bd4e699265da9b85c9f26609ddb524c8020281c6d39854f88b97ad"
+    },
+    {
+      "path": "tests/spec.rs",
+      "bytes": 26471,
+      "sha256": "cb61fb0c67908b02e18ac20d21a289ea66d671b44e69760c9c8c239a66397fef"
+    },
+    {
+      "path": "tests/w3c_regex_w3c.rs",
+      "bytes": 23466,
+      "sha256": "bad850b58ede480298085b5b94dc39eefdc8a2d37cedb50f8e504d362be446a4"
+    },
+    {
+      "path": "tests/w3c_regex_w3c_data/cases_part1.rs",
+      "bytes": 180168,
+      "sha256": "b2333243d30a3579531c5d14bd66ea7775c31a874697625489658c5176e16423"
+    },
+    {
+      "path": "tests/w3c_regex_w3c_data/cases_part2.rs",
+      "bytes": 245555,
+      "sha256": "0b88181532a182c5cbc251d9b8b05bafeac9a448c4f26e20efd5a36560f3a746"
+    },
+    {
+      "path": "tests/w3c_regex_w3c_data/mega_ranges.rs",
+      "bytes": 34628,
+      "sha256": "e5fb0b63d4703461634a3a7682855da4e5208adca4575223dca06858871bf260"
+    },
+    {
+      "path": "tests/xsd_corner_cases.rs",
+      "bytes": 26759,
+      "sha256": "610a1de1b544dc6485f19b718eba5350d6e01b39be408453ca67eb752b9bea7d"
+    }
+  ],
+  "localChanges": "See git diff and D3FEND-NOTES.md; original file hashes above are recorded before modifications.",
+  "reviewedTagRevision": "a0b2d2461c6991392ad021f60d6365d33448c5f7",
+  "upstreamRevision": "6aaaf48f928364aa7dbef60dc181ebb2d10847b2"
+}

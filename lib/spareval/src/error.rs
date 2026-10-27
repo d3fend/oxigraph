@@ -9,6 +9,9 @@ use std::ops::RangeInclusive;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum QueryEvaluationError {
+    /// A configured execution resource limit was exceeded.
+    #[error("The SPARQL operation exceeded the {stage} resource limit ({limit})")]
+    ResourceLimit { stage: &'static str, limit: usize },
     /// Error from the underlying RDF dataset
     #[error(transparent)]
     Dataset(Box<dyn Error + Send + Sync>),
@@ -71,6 +74,11 @@ impl From<ExpressionEvaluationError<Self>> for QueryEvaluationError {
     fn from(error: ExpressionEvaluationError<Self>) -> Self {
         match error {
             ExpressionEvaluationError::Context(e) => e,
+            ExpressionEvaluationError::Cancelled => Self::Cancelled,
+            ExpressionEvaluationError::ResourceLimit { stage, limit } => {
+                Self::ResourceLimit { stage, limit }
+            }
+            ExpressionEvaluationError::Regex(error) => Self::Unexpected(Box::new(error)),
             ExpressionEvaluationError::UnsupportedCustomFunction(name) => {
                 Self::UnsupportedCustomFunction(name)
             }
